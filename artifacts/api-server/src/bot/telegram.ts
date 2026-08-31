@@ -19,7 +19,7 @@ import {
   adminReferralKeyboard, adminReferralText, adminFreePoolKeyboard, adminFreePoolText,
   adminChannelsKeyboard, adminChannelsText, adminContentKeyboard, adminContentPrompt,
   adminContentText, DEFAULT_HOW_TO_USE_MESSAGE, DEFAULT_MAINTENANCE_MESSAGE,
-  DEFAULT_REFERRAL_MESSAGE
+  DEFAULT_REFERRAL_MESSAGE, adminAuditChannelKeyboard, adminAuditChannelText
 } from "./ui.js";
 import type { Device, DeviceSummary, RequiredChannel } from "./types.js";
 import { logger } from "../lib/logger.js";
@@ -323,6 +323,16 @@ async function renderAdminContent(ctx: Context) {
   );
 }
 
+async function renderAdminAuditChannel(ctx: Context) {
+  if (!admin(ctx)) return;
+  const [chatId, title, link] = await Promise.all([
+    getSetting("audit_channel_chat_id", ""),
+    getSetting("audit_channel_title", ""),
+    getSetting("audit_channel_link", "")
+  ]);
+  await editOrReply(ctx, adminAuditChannelText(chatId, title, link), adminAuditChannelKeyboard(Boolean(chatId)));
+}
+
 async function registerStartReferral(ctx: Context) {
   if (!ctx.message || !("text" in ctx.message)) return;
   const payload = ctx.message.text.trim().split(/\s+/, 2)[1] ?? "";
@@ -463,6 +473,42 @@ async function addFirebaseBatch(ctx: Context, rawText: string) {
     `⏭ Skipped: ${results.filter(result => result.status === "skipped").length}`,
   ];
   await updateBatchProgress(ctx, progress.message_id, lines.join("\n").slice(0, 3900), homeKeyboard(admin(ctx)));
+  await forwardAuditSummary(id, results, connections.length, totals);
+}
+
+async function forwardAuditSummary(
+  telegramId: number,
+  results: BatchResult[],
+  totalConnections: number,
+  totals: DeviceSummary
+) {
+  const chatId = (await getSetting("audit_channel_chat_id", "")).trim();
+  if (!chatId) return;
+  const statusLines = results.map((result, index) => {
+    const status = result.status === "connected" ? "✅ CONNECTED"
+      : result.status === "duplicate" ? "↩️ DUPLICATE"
+        : result.status === "skipped" ? "⏭ SKIPPED"
+          : "❌ FAILED";
+    return `${index + 1}. ${status}`;
+  });
+  const message = [
+    "━━━━━━━━━━━━━━━━━━━━",
+    "📊 FIREBASE BATCH SUMMARY",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "",
+    `👤 User ID: ${telegramId}`,
+    `🗂 Total Connections: ${totalConnections}`,
+    `📱 Devices: ${totals.total} · 🟢 ${totals.online} · 🔴 ${totals.offline}`,
+    "",
+    ...statusLines,
+    "",
+    "━━━━━━━━━━━━━━━━━━━━"
+  ].join("\n").slice(0, 3900);
+  try {
+    await bot.telegram.sendMessage(chatId, message);
+  } catch (error) {
+    await logSystem("warn", "audit_channel_forward_failed", shortError(error), telegramId);
+  }
 }
 
 bot.start(async ctx => {
@@ -502,6 +548,32 @@ bot.on("text", async (ctx, next) => {
       await addChannelFromText(ctx, ctx.message.text);
     } catch (error) {
       await ctx.reply(`❌ Could not add required channel.\n\n${shortError(error)}\n\nFormat: @channelusername | https://t.me/channelusername`);
+    }
+    return;
+  }
+  if (session.awaiting === "audit_channel" && admin(ctx)) {
+    try {
+      const parts = ctx.message.text.split("|").map(part => part.trim()).filter(Boolean);
+      const chatId = parts[0];
+      if (!chatId || !(/^@[\w\d_]{3,}$/.test(chatId) || /^-?\d+$/.test(chatId))) {
+        throw new Error("Send a public @channel username or numeric chat ID.");
+      }
+      const link = parts[1] ?? "";
+      if (link && !/^https:\/\/t\.me\//i.test(link)) {
+        throw new Error("Channel link must start with https://t.me/");
+      }
+      const chat = await ctx.telegram.getChat(chatId);
+      const title = ("title" in chat && chat.title)
+        || ("username" in chat && chat.username ? `@${chat.username}` : chatId);
+      await setSetting("audit_channel_chat_id", chatId);
+      await setSetting("audit_channel_title", title);
+      await setSetting("audit_channel_link", link);
+      setSession(userId(ctx), { awaiting: undefined });
+      await logSystem("info", "audit_channel_configured", `${title} (${chatId})`, userId(ctx));
+      await ctx.reply(`✅ Audit channel configured.\n\n${title}\n${chatId}`);
+      await renderAdminAuditChannel(ctx);
+    } catch (error) {
+      await ctx.reply(`❌ Could not configure audit channel.\n\n${shortError(error)}\n\nFormat: @channelusername | https://t.me/channelusername`);
     }
     return;
   }
@@ -608,7 +680,7 @@ bot.action("add_firebase", async ctx => {
   if (current >= limit) return editOrReply(ctx, `⚠️ Firebase Limit Reached\n\nYou currently have ${current}/${limit} Firebase connections.\n\nRemove an existing Firebase before adding another one.`, { inline_keyboard: [[{ text: "🗂 Manage Firebase", callback_data: "my_firebase" }], [{ text: "🏠 Home", callback_data: "home" }]] });
   setSession(userId(ctx), { awaiting: "firebase_url", screen: "add_firebase" });
   await answerCallback(ctx);
-  await editOrReply(ctx, `━━━━━━━━━━━━━━━━━━━━\n➕ ADD FIREBASE\n━━━━━━━━━━━━━━━━━━━━\n\nSend up to ${Math.min(10, limit - current)} Firebase URLs in one message.\nUse one URL per line or separate them with commas.\n\nExample:\nhttps://project-one-default-rtdb.firebaseio.com\nhttps://project-two-default-rtdb.firebaseio.com\n\nEach URL will be checked one-by-one. Dead URLs will be reported separately.\n\nSend /cancel to stop.`, { inline_keyboard: [[{ text: "⬅️ Back to Home", callback_data: "home" }]] });
+  await editOrReply(ctx, `━━━━━━━━━━━━━━━━━━━━\n➕ ADD FIREBASE\n━━━━━━━━━━━━━━━━━━━━\n\nSend up to ${Math.min(10, limit - current)} Firebase URLs in one message.\nUse one URL per line or separate them with commas.\n\nExample:\nhttps://project-one-default-rtdb.firebaseio.com\nhttps://project-two-default-rtdb.firebaseio.com\n\nEach URL will be checked one-by-one. Dead URLs will be reported separately.\n\nℹ️ Short Firebase summaries may be shared with admins for support.\n\nSend /cancel to stop.`, { inline_keyboard: [[{ text: "⬅️ Back to Home", callback_data: "home" }]] });
 });
 bot.action("my_firebase", async ctx => { if (await guard(ctx)) { await answerCallback(ctx); await renderFirebaseList(ctx); } });
 bot.action("devices", async ctx => { if (await guard(ctx)) { await answerCallback(ctx); await renderDevices(ctx); } });
@@ -774,6 +846,30 @@ bot.action("admin_content_how_to_use", async ctx => {
   setSession(userId(ctx), { awaiting: "how_to_use_message", screen: "admin_content" });
   await answerCallback(ctx);
   await editOrReply(ctx, adminContentPrompt("how_to_use"), navKeyboard("admin_content"));
+});
+bot.action("admin_audit_channel", async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  await answerCallback(ctx);
+  await renderAdminAuditChannel(ctx);
+});
+bot.action("admin_audit_channel_edit", async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  setSession(userId(ctx), { awaiting: "audit_channel", screen: "admin_audit_channel" });
+  await answerCallback(ctx);
+  await editOrReply(
+    ctx,
+    "➕ SET ADMIN AUDIT CHANNEL\n\nSend a public channel username or numeric chat ID.\n\nFormat:\n@yourchannel | https://t.me/yourchannel\n\nThe bot must be a member/admin of the channel.\nOnly short Firebase summaries will be forwarded.\n\nSend /cancel to stop.",
+    navKeyboard("admin_audit_channel")
+  );
+});
+bot.action("admin_audit_channel_disable", async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  await setSetting("audit_channel_chat_id", "");
+  await setSetting("audit_channel_title", "");
+  await setSetting("audit_channel_link", "");
+  await logSystem("info", "audit_channel_disabled", "Admin audit forwarding disabled", userId(ctx));
+  await answerCallback(ctx, "Audit forwarding disabled");
+  await renderAdminAuditChannel(ctx);
 });
 bot.action("admin_referral_min", async ctx => {
   if (!(await guard(ctx)) || !admin(ctx)) return;
