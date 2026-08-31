@@ -484,17 +484,14 @@ async function forwardAuditSummary(
 ) {
   const chatId = (await getSetting("audit_channel_chat_id", "")).trim();
   if (!chatId) return;
-  const statusLines = results.map((result, index) => {
-    const status = result.status === "connected" ? "✅ CONNECTED"
-      : result.status === "duplicate" ? "↩️ DUPLICATE"
-        : result.status === "skipped" ? "⏭ SKIPPED"
-          : "❌ FAILED";
+  const connectedResults = results.filter(result => result.status === "connected");
+  if (!connectedResults.length) return;
+  const statusLines = connectedResults.map((result, index) => {
     const link = result.url.slice(0, 220);
     const deviceSummary = result.summary
       ? `\n   Devices: ${result.summary.total} · Online: ${result.summary.online} · Offline: ${result.summary.offline}`
       : "";
-    const detail = result.status === "failed" ? `\n   ${result.detail.slice(0, 160)}` : "";
-    return `${index + 1}. ${status}\n   ${link}${deviceSummary}${detail}`;
+    return `${index + 1}. ✅ CONNECTED\n   ${link}${deviceSummary}`;
   });
   const message = [
     "━━━━━━━━━━━━━━━━━━━━",
