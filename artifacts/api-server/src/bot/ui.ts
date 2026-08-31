@@ -9,7 +9,7 @@ export const homeKeyboard = (showAdmin = false): InlineKeyboardMarkup => ({
     [{ text: "✨ Free Panels", callback_data: "free_panels" }, { text: "📱 Devices", callback_data: "devices" }],
     [{ text: "➕ Add Firebase", callback_data: "add_firebase" }, { text: "🗂 My Firebase", callback_data: "my_firebase" }],
     [{ text: "🔄 Refresh", callback_data: "home" }],
-    [{ text: "ℹ️ Help", callback_data: "help" }],
+    [{ text: "📘 How to Use", callback_data: "how_to_use" }],
     ...(showAdmin ? [[{ text: "👑 Admin Panel", callback_data: "admin" }]] : [])
   ]
 });
@@ -70,6 +70,8 @@ export function adminKeyboard(maintenanceEnabled: boolean): InlineKeyboardMarkup
       [{ text: "📊 Overview", callback_data: "admin_refresh" }, { text: "👥 Users", callback_data: "admin_users" }],
       [{ text: "🔥 Connections", callback_data: "admin_connections" }, { text: "📢 Broadcast", callback_data: "broadcast" }],
       [{ text: "🎁 Free Access", callback_data: "admin_free" }],
+      [{ text: "📝 Content", callback_data: "admin_content" }],
+      [{ text: "📣 Force Subscribe", callback_data: "admin_channels" }, { text: "🎯 Referral", callback_data: "admin_referral_min" }],
       [{ text: `🛠 Maintenance: ${maintenanceEnabled ? "ON" : "OFF"}`, callback_data: "maintenance" }, { text: "⚙️ Settings", callback_data: "admin_settings" }],
       [{ text: "📝 System Logs", callback_data: "logs" }],
       [{ text: "⬅️ Back to Home", callback_data: "home" }]
@@ -202,6 +204,38 @@ export function adminSettingsKeyboard(firebaseLimit: number, maintenanceEnabled:
   };
 }
 
+export const DEFAULT_HOW_TO_USE_MESSAGE =
+  "ℹ️ HOW TO USE\n\nAdd up to 10 Firebase Realtime Database URLs in one message. Use one URL per line or separate them with commas. Each URL is checked one-by-one and dead URLs are reported separately. Device data is deduplicated before display. Use Rescan for the latest data.";
+
+export const DEFAULT_MAINTENANCE_MESSAGE =
+  "🛠 BOT UNDER MAINTENANCE\n\nThe bot is currently undergoing maintenance.\nPlease try again later.";
+
+export const DEFAULT_REFERRAL_MESSAGE = [
+  "━━━━━━━━━━━━━━━━━━━━",
+  "✨ FREE PANELS",
+  "━━━━━━━━━━━━━━━━━━━━",
+  "",
+  "👥 Tere refers: {qualified}/{minimum}",
+  "📈 Total referred: {total}",
+  "",
+  "🎯 UNLOCK kaise kare?",
+  "1️⃣ Neeche wala REFER link dosto ko bhejo",
+  "2️⃣ Wo bot start kare + SAARE channels join kare",
+  "3️⃣ Referral verify hone ke baad free Firebase claim karo",
+  "",
+  "{unlock_status}",
+  "{required_channels}",
+  "",
+  "🔗 Your referral link:",
+  "{referral_link}",
+  "",
+  "━━━━━━━━━━━━━━━━━━━━"
+].join("\n");
+
+function fillTemplate(template: string, values: Record<string, string>): string {
+  return template.replace(/\{([a-z_]+)\}/gi, (_, key: string) => values[key.toLowerCase()] ?? `{${key}}`);
+}
+
 export function freePanelText(
   stats: ReferralStats,
   minimumReferrals: number,
@@ -209,38 +243,98 @@ export function freePanelText(
   joined: Map<string, boolean>,
   availablePanels: number,
   referralLink?: string,
-  claimed?: FreeFirebasePanel
+  claimed?: FreeFirebasePanel,
+  template = DEFAULT_REFERRAL_MESSAGE
 ): string {
-  const qualified = stats.qualified;
-  const remaining = Math.max(0, minimumReferrals - qualified);
+  const remaining = Math.max(0, minimumReferrals - stats.qualified);
+  let unlockStatus: string;
+  if (claimed) {
+    unlockStatus = ["✅ FREE FIREBASE ALREADY CLAIMED", "", `🔥 ${claimed.displayName}`, `🔗 ${claimed.firebaseUrl}`, "", "Ye reward tumhare account me add kar diya gaya hai."].join("\n");
+  } else if (remaining > 0) {
+    unlockStatus = `⏳ ${remaining} qualified referral${remaining === 1 ? "" : "s"} aur chahiye.`;
+  } else if (!availablePanels) {
+    unlockStatus = ["✅ Referral target complete hai.", "", "⏳ Admin pool me abhi koi free Firebase available nahi hai."].join("\n");
+  } else {
+    unlockStatus = ["✅ Referral target complete hai.", "", "🎁 Ab tum free Firebase claim kar sakte ho."].join("\n");
+  }
+  const requiredChannels = channels.length
+    ? ["📣 REQUIRED CHANNELS", ...channels.map(channel => `${joined.get(channel.id) ? "✅" : "❌"} ${channel.title}`)].join("\n")
+    : "";
+  return fillTemplate(template || DEFAULT_REFERRAL_MESSAGE, {
+    qualified: String(stats.qualified),
+    minimum: String(minimumReferrals),
+    total: String(stats.total),
+    available: String(availablePanels),
+    remaining: String(remaining),
+    referral_link: referralLink ?? "Referral link unavailable",
+    unlock_status: unlockStatus,
+    required_channels: requiredChannels
+  }).slice(0, 3900);
+}
+
+export function adminContentText(
+  referralMessage: string,
+  maintenanceMessage: string,
+  howToUseMessage: string
+): string {
+  const status = (value: string, fallback: string) => value && value !== fallback ? "✅ Customized" : "↩️ Default";
+  return [
+    "━━━━━━━━━━━━━━━━━━━━",
+    "📝 BOT CONTENT",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "",
+    `🎯 Referral message: ${status(referralMessage, DEFAULT_REFERRAL_MESSAGE)}`,
+    `🛠 Maintenance message: ${status(maintenanceMessage, DEFAULT_MAINTENANCE_MESSAGE)}`,
+    `📘 How to Use message: ${status(howToUseMessage, DEFAULT_HOW_TO_USE_MESSAGE)}`,
+    "",
+    "Har message ko neeche se edit karke multiline text bhej sakte ho.",
+    "Referral placeholders: {qualified}, {minimum}, {total}, {available}, {remaining}, {referral_link}, {unlock_status}, {required_channels}",
+    "",
+    "━━━━━━━━━━━━━━━━━━━━"
+  ].join("\n");
+}
+
+export function adminContentKeyboard(): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: "✏️ Edit Referral Message", callback_data: "admin_content_referral" }],
+      [{ text: "✏️ Edit Maintenance Message", callback_data: "admin_content_maintenance" }],
+      [{ text: "✏️ Edit How to Use", callback_data: "admin_content_how_to_use" }],
+      [{ text: "⬅️ Admin Dashboard", callback_data: "admin" }, { text: "🏠 Home", callback_data: "home" }]
+    ]
+  };
+}
+
+export function adminContentPrompt(kind: "referral" | "maintenance" | "how_to_use"): string {
+  if (kind === "referral") {
+    return [
+      "✏️ EDIT REFERRAL MESSAGE",
+      "",
+      "Send the complete message. Multiline text is supported.",
+      "",
+      "Available placeholders:",
+      "{qualified} {minimum} {total} {available} {remaining}",
+      "{referral_link} {unlock_status} {required_channels}",
+      "",
+      "Send /cancel to stop."
+    ].join("\n");
+  }
+  if (kind === "maintenance") return "✏️ EDIT MAINTENANCE MESSAGE\n\nSend the message users should see during maintenance.\n\nSend /cancel to stop.";
+  return "✏️ EDIT HOW TO USE\n\nSend the complete How to Use message. Multiline text is supported.\n\nSend /cancel to stop.";
+}
+
+export function adminChannelsText(channels: RequiredChannel[]): string {
   const lines = [
     "━━━━━━━━━━━━━━━━━━━━",
-    "✨ FREE PANELS",
+    "📣 FORCE SUBSCRIBE CHANNELS",
     "━━━━━━━━━━━━━━━━━━━━",
     "",
-    `👥 Tere refers: ${qualified}/${minimumReferrals}`,
-    `📈 Total referred: ${stats.total}`,
-    "",
-    "🎯 UNLOCK kaise kare?",
-    "1️⃣ Neeche wala REFER link dosto ko bhejo",
-    "2️⃣ Wo bot start kare + SAARE channels join kare",
-    "3️⃣ Referral verify hone ke baad free Firebase claim karo",
-    ""
+    "Users must join and verify every configured channel before their referral counts.",
   ];
-  if (claimed) {
-    lines.push("✅ FREE FIREBASE ALREADY CLAIMED", "", `🔥 ${claimed.displayName}`, `🔗 ${claimed.firebaseUrl}`, "", "Ye reward tumhare account me add kar diya gaya hai.");
-  } else if (remaining > 0) {
-    lines.push(`⏳ ${remaining} qualified referral${remaining === 1 ? "" : "s"} aur chahiye.`);
-  } else if (!availablePanels) {
-    lines.push("✅ Referral target complete hai.", "", "⏳ Admin pool me abhi koi free Firebase available nahi hai.");
-  } else {
-    lines.push("✅ Referral target complete hai.", "", "🎁 Ab tum free Firebase claim kar sakte ho.");
-  }
-  if (channels.length) {
-    lines.push("", "📣 REQUIRED CHANNELS");
-    for (const channel of channels) lines.push(`${joined.get(channel.id) ? "✅" : "❌"} ${channel.title}`);
-  }
-  if (referralLink) lines.push("", `🔗 Your referral link:\n${referralLink}`);
+  if (!channels.length) lines.push("", "No force subscribe channels configured. Referrals qualify after bot start.");
+  channels.forEach((channel, index) => {
+    lines.push("", `${index + 1}. ${channel.title}`, `🆔 ${channel.chatId}`, `🔗 ${channel.inviteLink ?? "No invite link"}`);
+  });
   lines.push("", "━━━━━━━━━━━━━━━━━━━━");
   return lines.join("\n");
 }
@@ -278,9 +372,9 @@ export function adminFreeAccessText(minimumReferrals: number, panels: FreeFireba
     "",
     `🎯 Minimum qualified referrals: ${minimumReferrals}`,
     `🔥 Free Firebase pool: ${available} available · ${assigned} assigned`,
-    `📣 Required channels: ${channels.length}`,
+    `📣 Force subscribe channels: ${channels.length}`,
     "",
-    "Admin yahan se referral target, reward Firebase pool, aur channel gate control kar sakta hai.",
+    "Admin yahan se referral target, reward Firebase pool, aur force subscribe channel gate control kar sakta hai.",
     "━━━━━━━━━━━━━━━━━━━━"
   ].join("\n");
 }
@@ -354,26 +448,10 @@ export function adminFreePoolKeyboard(panels: FreeFirebasePanel[]): InlineKeyboa
   };
 }
 
-export function adminChannelsText(channels: RequiredChannel[]): string {
-  const lines = [
-    "━━━━━━━━━━━━━━━━━━━━",
-    "📣 REQUIRED CHANNELS",
-    "━━━━━━━━━━━━━━━━━━━━",
-    "",
-    "Users must join and verify every channel before their referral counts.",
-  ];
-  if (!channels.length) lines.push("", "No required channels configured. Referrals qualify after bot start.");
-  channels.forEach((channel, index) => {
-    lines.push("", `${index + 1}. ${channel.title}`, `🆔 ${channel.chatId}`, `🔗 ${channel.inviteLink ?? "No invite link"}`);
-  });
-  lines.push("", "━━━━━━━━━━━━━━━━━━━━");
-  return lines.join("\n");
-}
-
 export function adminChannelsKeyboard(channels: RequiredChannel[]): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
-      [{ text: "➕ Add Required Channel", callback_data: "admin_channel_add" }],
+      [{ text: "➕ Add Force Subscribe", callback_data: "admin_channel_add" }],
       ...channels.map(channel => [{
         text: `🗑 Remove ${channel.title}`,
         callback_data: `admin_channel_remove:${channel.id}`
