@@ -335,7 +335,7 @@ export function adminAuditChannelText(chatId: string, title: string, link: strin
     link ? `🔗 ${link}` : "",
     "",
     "New Firebase batch summaries will be sent here.",
-    "Links and short totals/statuses are forwarded—no OTPs or device messages.",
+    "Only successful Firebase links and short totals are forwarded—no OTPs or device messages.",
     "Bot ko channel me admin/member permission dena zaroori hai.",
     "━━━━━━━━━━━━━━━━━━━━"
   ].filter(Boolean).join("\n");
