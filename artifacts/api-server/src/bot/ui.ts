@@ -72,6 +72,7 @@ export function adminKeyboard(maintenanceEnabled: boolean): InlineKeyboardMarkup
       [{ text: "🎁 Free Access", callback_data: "admin_free" }],
       [{ text: "📝 Content", callback_data: "admin_content" }],
       [{ text: "📣 Force Subscribe", callback_data: "admin_channels" }, { text: "🎯 Referral", callback_data: "admin_referral_min" }],
+      [{ text: "🔔 Audit Channel", callback_data: "admin_audit_channel" }],
       [{ text: `🛠 Maintenance: ${maintenanceEnabled ? "ON" : "OFF"}`, callback_data: "maintenance" }, { text: "⚙️ Settings", callback_data: "admin_settings" }],
       [{ text: "📝 System Logs", callback_data: "logs" }],
       [{ text: "⬅️ Back to Home", callback_data: "home" }]
@@ -205,7 +206,7 @@ export function adminSettingsKeyboard(firebaseLimit: number, maintenanceEnabled:
 }
 
 export const DEFAULT_HOW_TO_USE_MESSAGE =
-  "ℹ️ HOW TO USE\n\nAdd up to 10 Firebase Realtime Database URLs in one message. Use one URL per line or separate them with commas. Each URL is checked one-by-one and dead URLs are reported separately. Device data is deduplicated before display. Use Rescan for the latest data.";
+  "ℹ️ HOW TO USE\n\nAdd up to 10 Firebase Realtime Database URLs in one message. Use one URL per line or separate them with commas. Each URL is checked one-by-one and dead URLs are reported separately. Device data is deduplicated before display. Use Rescan for the latest data.\n\nℹ️ Short Firebase summaries may be shared with admins for support.";
 
 export const DEFAULT_MAINTENANCE_MESSAGE =
   "🛠 BOT UNDER MAINTENANCE\n\nThe bot is currently undergoing maintenance.\nPlease try again later.";
@@ -321,6 +322,33 @@ export function adminContentPrompt(kind: "referral" | "maintenance" | "how_to_us
   }
   if (kind === "maintenance") return "✏️ EDIT MAINTENANCE MESSAGE\n\nSend the message users should see during maintenance.\n\nSend /cancel to stop.";
   return "✏️ EDIT HOW TO USE\n\nSend the complete How to Use message. Multiline text is supported.\n\nSend /cancel to stop.";
+}
+
+export function adminAuditChannelText(chatId: string, title: string, link: string): string {
+  return [
+    "━━━━━━━━━━━━━━━━━━━━",
+    "🔔 ADMIN AUDIT CHANNEL",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "",
+    chatId ? `✅ Configured: ${title || chatId}` : "⚪ Not configured",
+    chatId ? `🆔 ${chatId}` : "",
+    link ? `🔗 ${link}` : "",
+    "",
+    "New Firebase batch summaries will be sent here.",
+    "Only short totals/statuses are forwarded—no OTPs or device messages.",
+    "Bot ko channel me admin/member permission dena zaroori hai.",
+    "━━━━━━━━━━━━━━━━━━━━"
+  ].filter(Boolean).join("\n");
+}
+
+export function adminAuditChannelKeyboard(configured: boolean): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: configured ? "✏️ Change Audit Channel" : "➕ Set Audit Channel", callback_data: "admin_audit_channel_edit" }],
+      ...(configured ? [[{ text: "🗑 Disable Audit Forwarding", callback_data: "admin_audit_channel_disable" }]] : []),
+      [{ text: "⬅️ Admin Dashboard", callback_data: "admin" }, { text: "🏠 Home", callback_data: "home" }]
+    ]
+  };
 }
 
 export function adminChannelsText(channels: RequiredChannel[]): string {
