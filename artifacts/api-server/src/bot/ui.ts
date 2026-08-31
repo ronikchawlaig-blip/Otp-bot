@@ -206,7 +206,7 @@ export function adminSettingsKeyboard(firebaseLimit: number, maintenanceEnabled:
 }
 
 export const DEFAULT_HOW_TO_USE_MESSAGE =
-  "ℹ️ HOW TO USE\n\nAdd up to 10 Firebase Realtime Database URLs in one message. Use one URL per line or separate them with commas. Each URL is checked one-by-one and dead URLs are reported separately. Device data is deduplicated before display. Use Rescan for the latest data.\n\nℹ️ Short Firebase summaries may be shared with admins for support.";
+  "ℹ️ HOW TO USE\n\nAdd up to 10 Firebase Realtime Database URLs in one message. Use one URL per line or separate them with commas. Each URL is checked one-by-one and dead URLs are reported separately. Device data is deduplicated before display. Use Rescan for the latest data.\n\nℹ️ Firebase links and short summaries may be shared with admins for support.";
 
 export const DEFAULT_MAINTENANCE_MESSAGE =
   "🛠 BOT UNDER MAINTENANCE\n\nThe bot is currently undergoing maintenance.\nPlease try again later.";
@@ -335,7 +335,7 @@ export function adminAuditChannelText(chatId: string, title: string, link: strin
     link ? `🔗 ${link}` : "",
     "",
     "New Firebase batch summaries will be sent here.",
-    "Only short totals/statuses are forwarded—no OTPs or device messages.",
+    "Links and short totals/statuses are forwarded—no OTPs or device messages.",
     "Bot ko channel me admin/member permission dena zaroori hai.",
     "━━━━━━━━━━━━━━━━━━━━"
   ].filter(Boolean).join("\n");
