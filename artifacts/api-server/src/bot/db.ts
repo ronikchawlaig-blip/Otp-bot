@@ -16,6 +16,12 @@ export const pool = new Pool({
   ssl: config.DATABASE_URL.includes("neon.tech") ? { rejectUnauthorized: false } : undefined
 });
 
+pool.on("error", (error) => {
+  // Neon can close an idle pooled connection. The pool removes that client;
+  // keep the bot process alive so the next query can establish a fresh one.
+  console.error("PostgreSQL pooled connection closed:", error instanceof Error ? error.message : error);
+});
+
 export async function ensureSchema(): Promise<void> {
   await pool.query(`
     CREATE EXTENSION IF NOT EXISTS pgcrypto;
