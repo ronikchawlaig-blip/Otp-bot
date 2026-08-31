@@ -79,6 +79,14 @@ export interface Session {
   selectedFirebaseId?: string;
   selectedDeviceId?: string;
   page: number;
-  awaiting?: "firebase_url" | "broadcast" | "free_firebase_url" | "required_channel" | "referral_minimum";
+  awaiting?:
+    | "firebase_url"
+    | "broadcast"
+    | "free_firebase_url"
+    | "required_channel"
+    | "referral_minimum"
+    | "referral_message"
+    | "maintenance_message"
+    | "how_to_use_message";
   monitoring?: boolean;
 }
