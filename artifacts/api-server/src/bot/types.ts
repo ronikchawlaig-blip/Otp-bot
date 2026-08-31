@@ -87,6 +87,7 @@ export interface Session {
     | "referral_minimum"
     | "referral_message"
     | "maintenance_message"
-    | "how_to_use_message";
+    | "how_to_use_message"
+    | "audit_channel";
   monitoring?: boolean;
 }
