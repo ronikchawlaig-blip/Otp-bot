@@ -17,7 +17,9 @@ import {
   connectionKeyboard, firebaseListText, homeKeyboard, homeText, navKeyboard,
   freePanelKeyboard, freePanelText, adminFreeAccessKeyboard, adminFreeAccessText,
   adminReferralKeyboard, adminReferralText, adminFreePoolKeyboard, adminFreePoolText,
-  adminChannelsKeyboard, adminChannelsText
+  adminChannelsKeyboard, adminChannelsText, adminContentKeyboard, adminContentPrompt,
+  adminContentText, DEFAULT_HOW_TO_USE_MESSAGE, DEFAULT_MAINTENANCE_MESSAGE,
+  DEFAULT_REFERRAL_MESSAGE
 } from "./ui.js";
 import type { Device, DeviceSummary, RequiredChannel } from "./types.js";
 import { logger } from "../lib/logger.js";
@@ -64,7 +66,7 @@ async function guard(ctx: Context): Promise<boolean> {
     return false;
   }
   if ((await getSetting("maintenance_mode", "false")) === "true" && !admin(ctx)) {
-    await ctx.reply("🛠 BOT UNDER MAINTENANCE\n\nThe bot is currently undergoing maintenance.\nPlease try again later.");
+    await ctx.reply(await getSetting("maintenance_message", DEFAULT_MAINTENANCE_MESSAGE));
     return false;
   }
   return true;
@@ -270,10 +272,11 @@ async function renderFreePanels(ctx: Context) {
   const channels = await getRequiredChannels();
   const membership = await checkRequiredChannels(ctx, channels);
   if (membership.allJoined) await qualifyReferral(id);
-  const [stats, panels, claimed] = await Promise.all([
+  const [stats, panels, claimed, referralMessage] = await Promise.all([
     getReferralStats(id),
     getFreeFirebasePanels(),
-    getClaimedFreePanel(id)
+    getClaimedFreePanel(id),
+    getSetting("referral_message", DEFAULT_REFERRAL_MESSAGE)
   ]);
   const minimum = Number(await getSetting("minimum_referrals", "3"));
   const available = panels.filter(panel => panel.active && !panel.assignedTo).length;
@@ -282,7 +285,7 @@ async function renderFreePanels(ctx: Context) {
   setSession(id, { screen: "free_panels" });
   await editOrReply(
     ctx,
-    freePanelText(stats, minimum, channels, membership.joined, available, referralLink, claimed),
+     freePanelText(stats, minimum, channels, membership.joined, available, referralLink, claimed, referralMessage),
     freePanelKeyboard(channels, referralLink, stats.claimed, canClaim)
   );
 }
@@ -304,6 +307,20 @@ async function renderAdminChannels(ctx: Context) {
   if (!admin(ctx)) return;
   const channels = await getRequiredChannels();
   await editOrReply(ctx, adminChannelsText(channels), adminChannelsKeyboard(channels));
+}
+
+async function renderAdminContent(ctx: Context) {
+  if (!admin(ctx)) return;
+  const [referralMessage, maintenanceMessage, howToUseMessage] = await Promise.all([
+    getSetting("referral_message", DEFAULT_REFERRAL_MESSAGE),
+    getSetting("maintenance_message", DEFAULT_MAINTENANCE_MESSAGE),
+    getSetting("how_to_use_message", DEFAULT_HOW_TO_USE_MESSAGE)
+  ]);
+  await editOrReply(
+    ctx,
+    adminContentText(referralMessage, maintenanceMessage, howToUseMessage),
+    adminContentKeyboard()
+  );
 }
 
 async function registerStartReferral(ctx: Context) {
@@ -501,6 +518,34 @@ bot.on("text", async (ctx, next) => {
     await renderAdminFreeAccess(ctx);
     return;
   }
+  if (
+    (session.awaiting === "referral_message" ||
+      session.awaiting === "maintenance_message" ||
+      session.awaiting === "how_to_use_message") &&
+    admin(ctx)
+  ) {
+    const value = ctx.message.text.trim().slice(0, 3900);
+    if (!value) {
+      await ctx.reply("❌ Message cannot be empty. Send the text again or use /cancel.");
+      return;
+    }
+    const key = session.awaiting === "referral_message"
+      ? "referral_message"
+      : session.awaiting === "maintenance_message"
+        ? "maintenance_message"
+        : "how_to_use_message";
+    const label = session.awaiting === "referral_message"
+      ? "Referral"
+      : session.awaiting === "maintenance_message"
+        ? "Maintenance"
+        : "How to Use";
+    await setSetting(key, value);
+    setSession(userId(ctx), { awaiting: undefined });
+    await logSystem("info", "bot_content_changed", `${label} message updated`, userId(ctx));
+    await ctx.reply(`✅ ${label} message saved.`);
+    await renderAdminContent(ctx);
+    return;
+  }
   if (session.awaiting === "broadcast" && admin(ctx)) {
     setSession(userId(ctx), { awaiting: undefined });
     const users = await (await import("./db.js")).query<{ telegram_id: string }>("SELECT telegram_id FROM users WHERE is_banned = false", []);
@@ -552,7 +597,10 @@ bot.action("claim_free_firebase", async ctx => {
   await answerCallback(ctx, "Free Firebase claimed!");
   await renderFreePanels(ctx);
 });
-bot.action("help", async ctx => { await answerCallback(ctx); await editOrReply(ctx, "ℹ️ HELP\n\nAdd up to 10 Firebase Realtime Database URLs in one message. Use one URL per line or separate them with commas. Each URL is checked one-by-one and dead URLs are reported separately. Device data is deduplicated before display. Use Rescan for the latest data.", navKeyboard()); });
+bot.action(["help", "how_to_use"], async ctx => {
+  await answerCallback(ctx);
+  await editOrReply(ctx, await getSetting("how_to_use_message", DEFAULT_HOW_TO_USE_MESSAGE), navKeyboard());
+});
 bot.action("add_firebase", async ctx => {
   if (!(await guard(ctx))) return;
   const limit = Number(await getSetting("firebase_limit", "10"));
@@ -708,6 +756,25 @@ bot.action("admin_users", async ctx => { if (await guard(ctx) && admin(ctx)) { a
 bot.action("admin_connections", async ctx => { if (await guard(ctx) && admin(ctx)) { await answerCallback(ctx); await renderAdminConnections(ctx); } });
 bot.action("admin_settings", async ctx => { if (await guard(ctx) && admin(ctx)) { await answerCallback(ctx); await renderAdminSettings(ctx); } });
 bot.action("admin_free", async ctx => { if (await guard(ctx) && admin(ctx)) { await answerCallback(ctx); await renderAdminFreeAccess(ctx); } });
+bot.action("admin_content", async ctx => { if (await guard(ctx) && admin(ctx)) { await answerCallback(ctx); await renderAdminContent(ctx); } });
+bot.action("admin_content_referral", async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  setSession(userId(ctx), { awaiting: "referral_message", screen: "admin_content" });
+  await answerCallback(ctx);
+  await editOrReply(ctx, adminContentPrompt("referral"), navKeyboard("admin_content"));
+});
+bot.action("admin_content_maintenance", async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  setSession(userId(ctx), { awaiting: "maintenance_message", screen: "admin_content" });
+  await answerCallback(ctx);
+  await editOrReply(ctx, adminContentPrompt("maintenance"), navKeyboard("admin_content"));
+});
+bot.action("admin_content_how_to_use", async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  setSession(userId(ctx), { awaiting: "how_to_use_message", screen: "admin_content" });
+  await answerCallback(ctx);
+  await editOrReply(ctx, adminContentPrompt("how_to_use"), navKeyboard("admin_content"));
+});
 bot.action("admin_referral_min", async ctx => {
   if (!(await guard(ctx)) || !admin(ctx)) return;
   const minimum = Number(await getSetting("minimum_referrals", "3"));
