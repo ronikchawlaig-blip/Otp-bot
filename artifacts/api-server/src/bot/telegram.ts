@@ -489,7 +489,12 @@ async function forwardAuditSummary(
       : result.status === "duplicate" ? "↩️ DUPLICATE"
         : result.status === "skipped" ? "⏭ SKIPPED"
           : "❌ FAILED";
-    return `${index + 1}. ${status}`;
+    const link = result.url.slice(0, 220);
+    const deviceSummary = result.summary
+      ? `\n   Devices: ${result.summary.total} · Online: ${result.summary.online} · Offline: ${result.summary.offline}`
+      : "";
+    const detail = result.status === "failed" ? `\n   ${result.detail.slice(0, 160)}` : "";
+    return `${index + 1}. ${status}\n   ${link}${deviceSummary}${detail}`;
   });
   const message = [
     "━━━━━━━━━━━━━━━━━━━━",
