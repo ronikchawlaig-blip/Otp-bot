@@ -1,0 +1,17 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "f0QW0Yv2agy0z3kvE8XBi"
+uri = "file://.local/conversation-workspace/files/attached_assets/telegram-device-manager-unselect-fix.zip"
+type = "unspecified"
+title = "Telegram Device Manager — unselect fix"
+description = "Updated deployable ZIP. Leaving the selected device screen now stops its message monitor and clears the selected device state."
+logical_id = "22cd1690-653b-4c66-ba75-9ddbdbe7df94"
+content_hash = "sha256:10c54b8564b4235ff04e6e4a342a089440adb79de786fadbb86d286eec70de7f"
+size = 112984
+mtime_ms = 1788164053232
+storage_uri = "gcs://replit-rams-assets-pike/rams/assets/conversation:9eb7b3d8-b576-4e2e-9236-37f23ce5f581/22cd1690-653b-4c66-ba75-9ddbdbe7df94/3f996154-3171-45b2-8944-5da1f1214c03"
+storage_version_token = "1788164065306972"
+content_type = "application/octet-stream"
+source_uri = "file://attached_assets/telegram-device-manager-unselect-fix.zip"
