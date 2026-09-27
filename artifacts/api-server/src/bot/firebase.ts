@@ -14,9 +14,13 @@ const OFFLINE_COLLECTION_KEYS = new Set(["offline", "offlinenumber", "offlinenum
 const EVENT_COLLECTION_KEYS = new Set([
   "events", "event", "logs", "messages", "message", "history",
   "sms", "smses", "smslist", "smsmessages", "smslogs",
-  "inbox", "received", "receivedmessages", "notifications"
+  "inbox", "inboxmessages", "received", "receivedmessages", "receivedsms",
+  "notifications", "incomingmessages", "smsdata", "otp", "otps"
 ].map(compactKey));
-const DEVICE_ID_KEYS = ["deviceId", "device_id", "deviceID", "serial", "imei", "id"];
+const DEVICE_ID_KEYS = [
+  "deviceId", "device_id", "deviceID", "serial", "imei", "id",
+  "clientId", "client_id", "deviceName", "device_name"
+];
 const NUMBER_KEYS = [
   "number", "phone", "phoneNumber", "phone_number", "mobile", "mobileNumber",
   "mobile_number", "mobileNo", "mobile_no", "mobNo", "mob_no", "msisdn",
@@ -350,7 +354,8 @@ export function collectEvents(device: Device, root?: unknown): Array<{
 function messageText(value: Record<string, unknown>): string | undefined {
   const messageKeys = [
     "message", "text", "content", "body", "sms", "smsBody", "sms_body",
-    "messageText", "message_text", "textMessage", "text_message"
+    "messageText", "message_text", "textMessage", "text_message",
+    "messageBody", "message_body", "msg", "otp"
   ];
   for (const key of messageKeys) {
     const candidate = valueFor(value, [key]);
