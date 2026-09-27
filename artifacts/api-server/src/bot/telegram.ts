@@ -35,7 +35,6 @@ const scanLocks = new Map<string, Promise<FreshSnapshot>>();
 type DeviceMonitor = { active: boolean; timer: ReturnType<typeof setInterval> };
 const monitors = new Map<string, DeviceMonitor>();
 const answeredCallbacks = new WeakSet<object>();
-const MAX_FIREBASE_BATCH = 10;
 const POOL_SCAN_TIMEOUT_MS = 8_000;
 const POOL_CACHE_TTL_MS = 10_000;
 let botUsername = "";
@@ -219,8 +218,46 @@ async function scanConnection(telegramId: number, firebaseId: string): Promise<F
 async function allSummary(telegramId: number) {
   const connections = await getConnections(telegramId);
   const summaries = new Map<string, DeviceSummary>();
-  for (const c of connections) summaries.set(c.id, await getSummary(c.id));
+  const values = await Promise.all(connections.map(async connection => [connection.id, await getSummary(connection.id)] as const));
+  for (const [id, summary] of values) summaries.set(id, summary);
   return { connections, summaries };
+}
+
+async function refreshAllConnections(telegramId: number) {
+  const connections = await getConnections(telegramId);
+  await Promise.allSettled(connections.map(connection => scanConnection(telegramId, connection.id)));
+  return allSummary(telegramId);
+}
+
+function summaryForDevices(devices: Device[]): DeviceSummary {
+  return {
+    total: devices.length,
+    online: devices.filter(device => device.status === "online").length,
+    offline: devices.filter(device => device.status === "offline").length,
+  };
+}
+
+function addSummary(target: DeviceSummary, source: DeviceSummary) {
+  target.total += source.total;
+  target.online += source.online;
+  target.offline += source.offline;
+}
+
+function aggregateHomeSources(
+  connections: Awaited<ReturnType<typeof getConnections>>,
+  summaries: Map<string, DeviceSummary>,
+  pool?: PoolSnapshot
+): { sourceCount: number; devices: DeviceSummary } {
+  const sources = new Map<string, DeviceSummary>();
+  for (const connection of connections) {
+    sources.set(connection.firebaseUrl, summaries.get(connection.id) ?? { total: 0, online: 0, offline: 0 });
+  }
+  for (const source of pool?.sources ?? []) {
+    if (source.ok) sources.set(source.panel.firebaseUrl, summaryForDevices(source.devices));
+  }
+  const devices = { total: 0, online: 0, offline: 0 };
+  for (const summary of sources.values()) addSummary(devices, summary);
+  return { sourceCount: sources.size, devices };
 }
 
 async function readPoolSources(force = false): Promise<PoolSnapshot> {
@@ -256,37 +293,19 @@ async function readPoolSources(force = false): Promise<PoolSnapshot> {
   }
 }
 
-async function renderHome(ctx: Context, includeImage = false) {
+async function renderHome(ctx: Context, includeImage = false, refresh = true) {
   const id = userId(ctx);
   unselectDevice(id);
   clearSession(id);
   const [{ connections, summaries }, pool] = await Promise.all([
-    allSummary(id),
-    readPoolSources().catch(() => undefined)
+    refresh ? refreshAllConnections(id) : allSummary(id),
+    readPoolSources(refresh).catch(() => undefined)
   ]);
-  const userDevices = [...summaries.values()].reduce(
-    (a, s) => ({ total: a.total + s.total, online: a.online + s.online, offline: a.offline + s.offline }),
-    { total: 0, online: 0, offline: 0 }
-  );
-  const poolHasSuccessfulSource = Boolean(pool?.sources.some(source => source.ok));
-  const devices = poolHasSuccessfulSource
-    ? pool!.sources.reduce(
-      (a, source) => {
-        for (const device of source.devices) {
-          a.total++;
-          if (device.status === "online") a.online++;
-          else a.offline++;
-        }
-        return a;
-      },
-      { total: 0, online: 0, offline: 0 }
-    )
-    : userDevices;
-  const sourceCount = poolHasSuccessfulSource ? pool!.configuredSources : connections.length;
-  const limit = Number(await getSetting("firebase_limit", "10"));
+  const combined = aggregateHomeSources(connections, summaries, pool);
+  const limit = Number(await getSetting("firebase_limit", "0"));
   await editOrReplyWithConfiguredImage(
     ctx,
-    homeText({ connections: sourceCount, devices }, limit),
+    homeText({ connections: combined.sourceCount, devices: combined.devices }, limit),
     homeKeyboard(admin(ctx)),
     includeImage ? IMAGE_SETTING_KEYS.welcome : undefined
   );
@@ -295,7 +314,7 @@ async function renderHome(ctx: Context, includeImage = false) {
 async function renderFirebaseList(ctx: Context) {
   const id = userId(ctx);
   const { connections, summaries } = await allSummary(id);
-  const limit = Number(await getSetting("firebase_limit", "10"));
+  const limit = Number(await getSetting("firebase_limit", "0"));
   pushScreen(id, "my_firebase");
   await editOrReply(ctx, firebaseListText(connections, summaries, limit), connectionKeyboard(connections, "firebase"));
 }
@@ -391,6 +410,21 @@ function splitFirebaseUrls(text: string): string[] {
       .map(value => value.trim().replace(/[),.;]+$/, ""))
       .filter(Boolean)
   )];
+}
+
+type FreePoolEntry = { raw: string; displayName?: string; url?: string };
+
+function splitFreePoolEntries(text: string): FreePoolEntry[] {
+  return text
+    .split(/\r?\n|,(?=\s*(?:[^|,\r\n]+\s*\|\s*)?https?:\/\/)/i)
+    .map(raw => raw.trim())
+    .filter(Boolean)
+    .map(raw => {
+      const match = raw.match(/https?:\/\/[^\s,]+/i);
+      const url = match?.[0]?.replace(/[),.;]+$/, "");
+      const namePart = match ? raw.slice(0, match.index).trim().replace(/[|:]\s*$/, "").trim() : "";
+      return { raw, displayName: namePart || undefined, url };
+    });
 }
 
 function shortError(error: unknown): string {
@@ -517,18 +551,81 @@ async function registerStartReferral(ctx: Context) {
 }
 
 async function addFreePoolFromText(ctx: Context, text: string) {
-  const parts = text.split("|").map(part => part.trim()).filter(Boolean);
-  const rawUrl = parts.length > 1 ? parts[parts.length - 1] : text.trim();
+  const id = userId(ctx);
+  const entries = splitFreePoolEntries(text);
+  if (!entries.length) throw new Error("Send one or more Firebase URLs, one per line or separated by commas.");
+  const before = await readPoolSources(true);
+  const beforeSummary = before.sources.filter(source => source.ok).reduce((total, source) => {
+    addSummary(total, summaryForDevices(source.devices));
+    return total;
+  }, { total: 0, online: 0, offline: 0 });
   const panels = await getFreeFirebasePanels();
-  const displayName = parts.length > 1
-    ? parts.slice(0, -1).join(" | ").slice(0, 120)
-    : `Free Firebase ${panels.length + 1}`;
-  const url = validateFirebaseUrl(rawUrl);
-  await addFreeFirebasePanel(url, displayName);
+  const existingUrls = new Set(panels.map(panel => panel.firebaseUrl));
+  const results: Array<{ entry: FreePoolEntry; status: "connected" | "failed" | "duplicate"; detail: string; summary?: DeviceSummary }> = [];
+  const progress = await ctx.reply(`⏳ Checking Firebase sources...\n\nFound ${entries.length} source${entries.length === 1 ? "" : "s"}.\nEvery source will be verified before activation.`);
+  let added = 0;
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    const displayUrl = entry.url && entry.url.length > 90 ? `${entry.url.slice(0, 87)}...` : entry.url ?? entry.raw;
+    await updateBatchProgress(ctx, progress.message_id, `🔄 Checking Firebase ${index + 1}/${entries.length}\n\n${displayUrl}`);
+    try {
+      if (!entry.url) throw new Error("No Firebase URL found");
+      const url = validateFirebaseUrl(entry.url);
+      if (existingUrls.has(url)) {
+        results.push({ entry: { ...entry, url }, status: "duplicate", detail: "Already in the device source pool" });
+        continue;
+      }
+      const root = await readFirebase(url);
+      const devices = extractDevices(root);
+      const displayName = (entry.displayName ?? `Free Firebase ${panels.length + added + 1}`).slice(0, 120);
+      await addFreeFirebasePanel(url, displayName);
+      existingUrls.add(url);
+      added++;
+      invalidatePoolSnapshot();
+      results.push({ entry: { ...entry, url, displayName }, status: "connected", detail: "Checked and activated", summary: summaryForDevices(devices) });
+    } catch (error) {
+      results.push({ entry, status: "failed", detail: shortError(error) });
+    }
+  }
+
   invalidatePoolSnapshot();
-  await logSystem("info", "free_firebase_added", `${displayName}: ${url}`, userId(ctx));
-  setSession(userId(ctx), { awaiting: undefined });
-  await ctx.reply(`✅ Free Firebase added to reward pool.\n\n${displayName}\n${url}`);
+  const after = await readPoolSources(true);
+  const afterSummary = after.sources.filter(source => source.ok).reduce((total, source) => {
+    addSummary(total, summaryForDevices(source.devices));
+    return total;
+  }, { total: 0, online: 0, offline: 0 });
+  const newDevices = Math.max(0, afterSummary.total - beforeSummary.total);
+  setSession(id, { awaiting: undefined });
+  const lines = [
+    "━━━━━━━━━━━━━━━━━━━━",
+    "📊 FIREBASE SOURCE BATCH RESULT",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "",
+    ...results.map((result, index) => {
+      const label = result.status === "connected" ? "✅ ACTIVATED" : result.status === "duplicate" ? "↩️ DUPLICATE" : "❌ FAILED";
+      const summary = result.summary ? `\n   Devices: ${result.summary.total} · Online: ${result.summary.online} · Offline: ${result.summary.offline}` : "";
+      return `${index + 1}. ${label}\n   ${result.entry.url ?? result.entry.raw}\n   ${result.detail}${summary}`;
+    }),
+    "",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "📈 ALL FIREBASE SUMMARY",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "",
+    `🔥 Sources Before: ${before.configuredSources}`,
+    `✅ Sources Activated: ${added}`,
+    `🔥 Sources After: ${after.configuredSources}`,
+    `📱 Devices Before: ${beforeSummary.total}`,
+    `➕ New Devices Added: ${newDevices}`,
+    `📱 Devices After: ${afterSummary.total}`,
+    `🟢 Online: ${afterSummary.online}`,
+    `🔴 Offline: ${afterSummary.offline}`,
+    "",
+    `✅ Activated: ${results.filter(result => result.status === "connected").length}`,
+    `❌ Failed: ${results.filter(result => result.status === "failed").length}`,
+    `↩️ Duplicate: ${results.filter(result => result.status === "duplicate").length}`,
+  ];
+  await updateBatchProgress(ctx, progress.message_id, lines.join("\n").slice(0, 3900), adminFreePoolKeyboard(await getFreeFirebasePanels()));
+  await logSystem("info", "free_firebase_batch_checked", `Activated ${added} of ${entries.length}; devices ${beforeSummary.total} -> ${afterSummary.total}`, id);
   await renderAdminFreePool(ctx);
 }
 
@@ -555,28 +652,25 @@ async function addChannelFromText(ctx: Context, text: string) {
 async function addFirebaseBatch(ctx: Context, rawText: string) {
   const id = userId(ctx);
   const inputUrls = splitFirebaseUrls(rawText);
-  const limit = Number(await getSetting("firebase_limit", "10"));
   const existingConnections = await getConnections(id);
-  const remaining = Math.max(0, limit - existingConnections.length);
+  const beforeState = await allSummary(id);
+  const beforeTotals = [...beforeState.summaries.values()].reduce((acc, summary) => {
+    addSummary(acc, summary);
+    return acc;
+  }, { total: 0, online: 0, offline: 0 });
   const results: BatchResult[] = [];
-  const urlsToCheck = inputUrls.slice(0, MAX_FIREBASE_BATCH);
-  const progress = await ctx.reply(`⏳ Preparing Firebase checks...\n\nFound ${inputUrls.length} URL${inputUrls.length === 1 ? "" : "s"}.\nChecking one-by-one...`);
+  const progress = await ctx.reply(`⏳ Preparing Firebase checks...\n\nFound ${inputUrls.length} URL${inputUrls.length === 1 ? "" : "s"}.\nChecking every source one-by-one...`);
 
   if (!inputUrls.length) {
-    await updateBatchProgress(ctx, progress.message_id, "❌ No Firebase URLs found.\n\nSend one URL per line, or separate URLs with commas.");
+    await updateBatchProgress(ctx, progress.message_id, "❌ No Firebase URLs found.\n\nSend one URL per line, or separate them with commas.");
     return;
   }
 
   let added = 0;
-  for (let index = 0; index < urlsToCheck.length; index++) {
-    const rawUrl = urlsToCheck[index];
+  for (let index = 0; index < inputUrls.length; index++) {
+    const rawUrl = inputUrls[index];
     const displayUrl = rawUrl.length > 90 ? `${rawUrl.slice(0, 87)}...` : rawUrl;
-    await updateBatchProgress(ctx, progress.message_id, `🔄 Checking Firebase ${index + 1}/${urlsToCheck.length}\n\n${displayUrl}\n\nThis URL is being verified now...`);
-    if (added >= remaining) {
-      results.push({ url: rawUrl, status: "skipped", detail: `Connection limit reached (${limit})` });
-      continue;
-    }
-
+    await updateBatchProgress(ctx, progress.message_id, `🔄 Checking Firebase ${index + 1}/${inputUrls.length}\n\n${displayUrl}\n\nThis URL is being verified now...`);
     try {
       const url = validateFirebaseUrl(rawUrl);
       if (existingConnections.some(connection => connection.firebaseUrl === url)) {
@@ -599,24 +693,14 @@ async function addFirebaseBatch(ctx: Context, rawText: string) {
       results.push({ url: rawUrl, status: "failed", detail: shortError(error) });
     }
   }
-  if (inputUrls.length > MAX_FIREBASE_BATCH) {
-    results.push(...inputUrls.slice(MAX_FIREBASE_BATCH).map(url => ({
-      url,
-      status: "skipped" as const,
-      detail: `Batch limit is ${MAX_FIREBASE_BATCH} URLs`
-    })));
-  }
 
   setSession(id, { awaiting: undefined });
   const { connections, summaries } = await allSummary(id);
-  const totals = [...summaries.values()].reduce(
-    (acc, summary) => ({
-      total: acc.total + summary.total,
-      online: acc.online + summary.online,
-      offline: acc.offline + summary.offline,
-    }),
-    { total: 0, online: 0, offline: 0 }
-  );
+  const totals = [...summaries.values()].reduce((acc, summary) => {
+    addSummary(acc, summary);
+    return acc;
+  }, { total: 0, online: 0, offline: 0 });
+  const newDevices = Math.max(0, totals.total - beforeTotals.total);
   const lines = [
     "━━━━━━━━━━━━━━━━━━━━",
     "📊 FIREBASE BATCH RESULT",
@@ -625,8 +709,7 @@ async function addFirebaseBatch(ctx: Context, rawText: string) {
     ...results.map((result, index) => {
       const label = result.status === "connected" ? "✅ CONNECTED"
         : result.status === "duplicate" ? "↩️ DUPLICATE"
-          : result.status === "skipped" ? "⏭ SKIPPED"
-            : "❌ DEAD / FAILED";
+          : "❌ DEAD / FAILED";
       const deviceSummary = result.summary
         ? `\n   Devices: ${result.summary.total} · Online: ${result.summary.online} · Offline: ${result.summary.offline}`
         : "";
@@ -638,15 +721,16 @@ async function addFirebaseBatch(ctx: Context, rawText: string) {
     "━━━━━━━━━━━━━━━━━━━━",
     "",
     `🔥 Firebase Added This Round: ${added}`,
-    `🗂 Total Firebase Connections: ${connections.length}/${limit}`,
-    `📱 Total Devices: ${totals.total}`,
+    `🗂 Total Firebase Connections: ${connections.length}/∞`,
+    `📱 Devices Before: ${beforeTotals.total}`,
+    `➕ New Devices Added: ${newDevices}`,
+    `📱 Devices After: ${totals.total}`,
     `🟢 Total Online: ${totals.online}`,
     `🔴 Total Offline: ${totals.offline}`,
     "",
     `✅ Connected: ${results.filter(result => result.status === "connected").length}`,
     `❌ Dead / Failed: ${results.filter(result => result.status === "failed").length}`,
     `↩️ Duplicate: ${results.filter(result => result.status === "duplicate").length}`,
-    `⏭ Skipped: ${results.filter(result => result.status === "skipped").length}`,
   ];
   await updateBatchProgress(ctx, progress.message_id, lines.join("\n").slice(0, 3900), homeKeyboard(admin(ctx)));
   await forwardAuditSummary(id, results, connections.length, totals);
@@ -829,7 +913,7 @@ bot.on("text", async (ctx, next) => {
     try {
       await addFreePoolFromText(ctx, ctx.message.text);
     } catch (error) {
-      await ctx.reply(`❌ Could not add free Firebase.\n\n${shortError(error)}\n\nFormat: Optional Name | https://your-project.firebaseio.com`);
+      await ctx.reply(`❌ Could not add free Firebase.\n\n${shortError(error)}\n\nFormat: Optional Name | https://your-project.firebaseio.com\nFor bulk: one source per line or comma-separated.`);
     }
     return;
   }
@@ -1036,12 +1120,9 @@ bot.action(["help", "how_to_use"], async ctx => {
 });
 bot.action("add_firebase", async ctx => {
   if (!(await guard(ctx))) return;
-  const limit = Number(await getSetting("firebase_limit", "10"));
-  const current = await countConnections(userId(ctx));
-  if (current >= limit) return editOrReply(ctx, `⚠️ Firebase Limit Reached\n\nYou currently have ${current}/${limit} Firebase connections.\n\nRemove an existing Firebase before adding another one.`, { inline_keyboard: [[{ text: "🗂 Manage Firebase", callback_data: "my_firebase" }], [{ text: "🏠 Home", callback_data: "home" }]] });
   setSession(userId(ctx), { awaiting: "firebase_url", screen: "add_firebase" });
   await answerCallback(ctx);
-  await editOrReply(ctx, `━━━━━━━━━━━━━━━━━━━━\n➕ ADD FIREBASE\n━━━━━━━━━━━━━━━━━━━━\n\nSend up to ${Math.min(10, limit - current)} Firebase URLs in one message.\nUse one URL per line or separate them with commas.\n\nExample:\nhttps://project-one-default-rtdb.firebaseio.com\nhttps://project-two-default-rtdb.firebaseio.com\n\nEach URL will be checked one-by-one. Dead URLs will be reported separately.\n\nℹ️ Short Firebase summaries may be shared with admins for support.\n\nSend /cancel to stop.`, { inline_keyboard: [[{ text: "⬅️ Back to Home", callback_data: "home" }]] });
+  await editOrReply(ctx, `━━━━━━━━━━━━━━━━━━━━\n➕ ADD FIREBASE\n━━━━━━━━━━━━━━━━━━━━\n\nSend any number of Firebase URLs in one message.\nUse one URL per line or separate them with commas.\n\nExample:\nhttps://project-one-default-rtdb.firebaseio.com\nhttps://project-two-default-rtdb.firebaseio.com\n\nEvery URL will be checked one-by-one. Dead URLs will be reported separately, with device totals shown before and after the batch.\n\nℹ️ Short Firebase summaries may be shared with admins for support.\n\nSend /cancel to stop.`, { inline_keyboard: [[{ text: "⬅️ Back to Home", callback_data: "home" }]] });
 });
 bot.action("my_firebase", async ctx => { if (await guard(ctx)) { await answerCallback(ctx); await renderFirebaseList(ctx); } });
 bot.action("devices", async ctx => { if (await guard(ctx)) { await answerCallback(ctx); await renderDevices(ctx); } });
@@ -1331,7 +1412,7 @@ bot.action("admin_free_pool_add", async ctx => {
   if (!(await guard(ctx)) || !admin(ctx)) return;
   setSession(userId(ctx), { awaiting: "free_firebase_url", screen: "admin_free_pool" });
   await answerCallback(ctx);
-  await editOrReply(ctx, "➕ ADD FREE FIREBASE\n\nSend:\nhttps://project-default-rtdb.firebaseio.com\n\nOr with a display name:\nPanel 1 | https://project-default-rtdb.firebaseio.com\n\nSend /cancel to stop.", navKeyboard("admin_free_pool"));
+  await editOrReply(ctx, "➕ ADD FIREBASE SOURCES\n\nSend one or many Firebase URLs, one per line or separated by commas.\n\nOptional display name format (one per line):\nPanel 1 | https://project-default-rtdb.firebaseio.com\nPanel 2 | https://another-project.firebaseio.com\n\nEvery source is checked before activation, and the result shows devices before, new devices, and devices after.\n\nSend /cancel to stop.", navKeyboard("admin_free_pool"));
 });
 bot.action(/^admin_free_pool_remove:(.+)$/, async ctx => {
   if (!(await guard(ctx)) || !admin(ctx)) return;
@@ -1386,10 +1467,9 @@ bot.action(/^admin_user_apply:(-?\d+):(ban|unban)$/, async ctx => {
 });
 bot.action(/^admin_limit:(2|5|10|20)$/, async ctx => {
   if (!(await guard(ctx)) || !admin(ctx)) return;
-  const limit = Number(ctx.match[1]);
-  await setSetting("firebase_limit", String(limit));
-  await logSystem("info", "firebase_limit_changed", `Firebase limit set to ${limit}`, userId(ctx));
-  await answerCallback(ctx, `Limit set to ${limit}`);
+  await setSetting("firebase_limit", "0");
+  await logSystem("info", "firebase_limit_removed", "Firebase connection limit is unlimited", userId(ctx));
+  await answerCallback(ctx, "Firebase limit removed");
   await renderAdminSettings(ctx);
 });
 bot.action("broadcast", async ctx => { if (await guard(ctx) && admin(ctx)) { setSession(userId(ctx), { awaiting: "broadcast" }); await answerCallback(ctx); await editOrReply(ctx, "━━━━━━━━━━━━━━━━━━━━\n📢 BROADCAST\n━━━━━━━━━━━━━━━━━━━━\n\nSend the message you want to broadcast.\n\nThe message will be previewed before sending.", navKeyboard("admin")); } });
