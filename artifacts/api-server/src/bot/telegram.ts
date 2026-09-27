@@ -7,7 +7,8 @@ import {
   markConnectionChecked, markEventSeen, pool, removeConnection, replaceDevices, setSetting,
   setUserBanned, ensureSchema, registerReferral, qualifyReferral, getReferralStats,
   addFreeFirebasePanel, getFreeFirebasePanels, removeFreeFirebasePanel, claimFreeFirebase,
-  getClaimedFreePanel, addRequiredChannel, getRequiredChannels, removeRequiredChannel
+  getClaimedFreePanel, addRequiredChannel, getRequiredChannels, removeRequiredChannel,
+  getAccessStatus, grantTimedAccess
 } from "./db.js";
 import { collectEvents, extractDevices, readFirebase, validateFirebaseUrl } from "./firebase.js";
 import { back, clearSession, getSession, pushScreen, setSession } from "./state.js";
@@ -19,7 +20,10 @@ import {
   adminReferralKeyboard, adminReferralText, adminFreePoolKeyboard, adminFreePoolText,
   adminChannelsKeyboard, adminChannelsText, adminContentKeyboard, adminContentPrompt,
   adminContentText, DEFAULT_HOW_TO_USE_MESSAGE, DEFAULT_MAINTENANCE_MESSAGE,
-  DEFAULT_REFERRAL_MESSAGE, adminAuditChannelKeyboard, adminAuditChannelText
+  DEFAULT_REFERRAL_MESSAGE, adminAuditChannelKeyboard, adminAuditChannelText,
+  adminImagesKeyboard, adminImagesText, premiumizeKeyboard,
+  accessGateKeyboard, accessGateText, deviceDetailKeyboard, deviceDetailText,
+  lastSmsKeyboard, lastSmsText
 } from "./ui.js";
 import type { Device, DeviceSummary, RequiredChannel } from "./types.js";
 import { logger } from "../lib/logger.js";
@@ -33,6 +37,11 @@ const monitors = new Map<string, DeviceMonitor>();
 const answeredCallbacks = new WeakSet<object>();
 const MAX_FIREBASE_BATCH = 10;
 let botUsername = "";
+const IMAGE_SETTING_KEYS = {
+  welcome: "welcome_image_file_id",
+  access: "access_image_file_id",
+  device: "device_image_file_id",
+} as const;
 
 function userId(ctx: Context): number {
   if (!ctx.from) throw new Error("Missing Telegram user");
@@ -57,7 +66,7 @@ async function answerCallback(ctx: Context, text?: string, extra?: any) {
   }
 }
 
-async function guard(ctx: Context): Promise<boolean> {
+async function baseGuard(ctx: Context): Promise<boolean> {
   void answerCallback(ctx);
   await ensureUser(ctx);
   const id = userId(ctx);
@@ -72,14 +81,55 @@ async function guard(ctx: Context): Promise<boolean> {
   return true;
 }
 
+async function renderAccessGate(ctx: Context, includeImage = false) {
+  const id = userId(ctx);
+  if (includeImage) await sendConfiguredImage(ctx, IMAGE_SETTING_KEYS.access);
+  const channels = await getRequiredChannels();
+  const membership = await checkRequiredChannels(ctx, channels);
+  if (membership.allJoined) await qualifyReferral(id);
+  const [stats, access, durationValue] = await Promise.all([
+    getReferralStats(id),
+    getAccessStatus(id),
+    getSetting("access_duration_minutes", "45")
+  ]);
+  const minimum = Number(await getSetting("minimum_referrals", "3"));
+  const durationMinutes = Math.max(1, Number(durationValue) || 45);
+  const referralLink = botUsername ? `https://t.me/${botUsername}?start=ref_${id}` : undefined;
+  await editOrReply(
+    ctx,
+    accessGateText(stats, minimum, durationMinutes, channels, membership.joined, referralLink, access),
+    accessGateKeyboard(channels, referralLink)
+  );
+}
+
+async function guard(ctx: Context): Promise<boolean> {
+  if (!(await baseGuard(ctx))) return false;
+  if (admin(ctx)) return true;
+  const access = await getAccessStatus(userId(ctx));
+  if (access.active) return true;
+  await renderAccessGate(ctx);
+  return false;
+}
+
 async function editOrReply(ctx: Context, text: string, keyboard?: unknown) {
+  const styledKeyboard = premiumizeKeyboard(keyboard) as any;
   if ("callbackQuery" in ctx && ctx.callbackQuery) {
     try {
-      await ctx.editMessageText(text, keyboard ? { reply_markup: keyboard as any } : undefined);
+      await ctx.editMessageText(text, styledKeyboard ? { reply_markup: styledKeyboard } : undefined);
       return;
     } catch { /* The message may be unchanged or no longer editable. */ }
   }
-  await ctx.reply(text, keyboard ? Markup.inlineKeyboard((keyboard as any).inline_keyboard) : undefined);
+  await ctx.reply(text, styledKeyboard ? Markup.inlineKeyboard(styledKeyboard.inline_keyboard) : undefined);
+}
+
+async function sendConfiguredImage(ctx: Context, settingKey: string) {
+  const fileId = (await getSetting(settingKey, "")).trim();
+  if (!fileId) return;
+  try {
+    await ctx.replyWithPhoto(fileId);
+  } catch (error) {
+    await logSystem("warn", "configured_image_send_failed", `${settingKey}: ${shortError(error)}`, userId(ctx));
+  }
 }
 
 async function scanConnection(telegramId: number, firebaseId: string): Promise<FreshSnapshot> {
@@ -123,10 +173,11 @@ async function allSummary(telegramId: number) {
   return { connections, summaries };
 }
 
-async function renderHome(ctx: Context) {
+async function renderHome(ctx: Context, includeImage = false) {
   const id = userId(ctx);
   unselectDevice(id);
   clearSession(id);
+  if (includeImage) await sendConfiguredImage(ctx, IMAGE_SETTING_KEYS.welcome);
   const { connections, summaries } = await allSummary(id);
   const devices = [...summaries.values()].reduce((a, s) => ({ total: a.total + s.total, online: a.online + s.online, offline: a.offline + s.offline }), { total: 0, online: 0, offline: 0 });
   const limit = Number(await getSetting("firebase_limit", "10"));
@@ -241,12 +292,13 @@ function shortError(error: unknown): string {
 
 async function updateBatchProgress(ctx: Context, messageId: number, text: string, keyboard?: unknown) {
   try {
+    const styledKeyboard = premiumizeKeyboard(keyboard) as any;
     await ctx.telegram.editMessageText(
       ctx.chat!.id,
       messageId,
       undefined,
       text,
-      keyboard ? { reply_markup: keyboard as any } : undefined
+      styledKeyboard ? { reply_markup: styledKeyboard } : undefined
     );
   } catch {
     // Telegram rejects edits when the text is unchanged; the batch can continue.
@@ -294,7 +346,8 @@ async function renderAdminFreeAccess(ctx: Context) {
   if (!admin(ctx)) return;
   const [panels, channels] = await Promise.all([getFreeFirebasePanels(), getRequiredChannels()]);
   const minimum = Number(await getSetting("minimum_referrals", "3"));
-  await editOrReply(ctx, adminFreeAccessText(minimum, panels, channels), adminFreeAccessKeyboard());
+  const duration = Math.max(1, Number(await getSetting("access_duration_minutes", "45")) || 45);
+  await editOrReply(ctx, adminFreeAccessText(minimum, duration, panels, channels), adminFreeAccessKeyboard());
 }
 
 async function renderAdminFreePool(ctx: Context) {
@@ -320,6 +373,20 @@ async function renderAdminContent(ctx: Context) {
     ctx,
     adminContentText(referralMessage, maintenanceMessage, howToUseMessage),
     adminContentKeyboard()
+  );
+}
+
+async function renderAdminImages(ctx: Context) {
+  if (!admin(ctx)) return;
+  const [welcome, access, device] = await Promise.all([
+    getSetting(IMAGE_SETTING_KEYS.welcome, ""),
+    getSetting(IMAGE_SETTING_KEYS.access, ""),
+    getSetting(IMAGE_SETTING_KEYS.device, "")
+  ]);
+  await editOrReply(
+    ctx,
+    adminImagesText(Boolean(welcome), Boolean(access), Boolean(device)),
+    adminImagesKeyboard(Boolean(welcome), Boolean(access), Boolean(device))
   );
 }
 
@@ -513,14 +580,133 @@ async function forwardAuditSummary(
   }
 }
 
+type SelectedPoolDevice = {
+  firebaseId: string;
+  firebaseUrl: string;
+  sourceName: string;
+  device: Device;
+};
+
+async function selectRandomPoolDevice(telegramId: number): Promise<SelectedPoolDevice> {
+  const panels = (await getFreeFirebasePanels()).filter(panel => panel.active);
+  if (!panels.length) throw new Error("Admin has not configured any active Firebase device sources.");
+
+  const shuffledPanels = [...panels].sort(() => Math.random() - 0.5);
+  const failures: string[] = [];
+  for (const panel of shuffledPanels) {
+    try {
+      const root = await readFirebase(panel.firebaseUrl);
+      const devices = extractDevices(root);
+      if (!devices.length) {
+        failures.push(`${panel.displayName}: no devices found`);
+        continue;
+      }
+      const online = devices.filter(device => device.status === "online");
+      const candidates = online.length ? online : devices;
+      const device = candidates[Math.floor(Math.random() * candidates.length)];
+      const existing = (await getConnections(telegramId)).find(
+        connection => connection.firebaseUrl === panel.firebaseUrl
+      );
+      const firebaseId = existing?.id ?? await addConnection(telegramId, panel.firebaseUrl, panel.displayName);
+      await replaceDevices(firebaseId, devices);
+      await markConnectionChecked(firebaseId, "connected");
+      return {
+        firebaseId,
+        firebaseUrl: panel.firebaseUrl,
+        sourceName: panel.displayName,
+        device,
+      };
+    } catch (error) {
+      failures.push(`${panel.displayName}: ${shortError(error)}`);
+    }
+  }
+  throw new Error(`No Firebase source could provide a device.\n\n${failures.slice(0, 3).join("\n")}`);
+}
+
+async function renderSelectedDevice(ctx: Context, selected: SelectedPoolDevice) {
+  const id = userId(ctx);
+  setSession(id, {
+    screen: "device_detail",
+    selectedFirebaseId: selected.firebaseId,
+    selectedDeviceId: selected.device.normalizedDeviceId,
+    monitoring: true,
+  });
+  startMonitor(id, selected.firebaseId, selected.device);
+  await sendConfiguredImage(ctx, IMAGE_SETTING_KEYS.device);
+  await editOrReply(
+    ctx,
+    deviceDetailText(selected.device, selected.sourceName),
+    deviceDetailKeyboard(selected.firebaseId, selected.device.normalizedDeviceId)
+  );
+}
+
+async function generateAndRenderDevice(ctx: Context) {
+  const id = userId(ctx);
+  unselectDevice(id);
+  try {
+    const selected = await selectRandomPoolDevice(id);
+    await answerCallback(ctx);
+    await renderSelectedDevice(ctx, selected);
+  } catch (error) {
+    await answerCallback(ctx, "No device available", { show_alert: true });
+    await editOrReply(
+      ctx,
+      `❌ DEVICE GENERATION FAILED\n\n${shortError(error)}\n\nPlease try again after the admin adds a working Firebase source.`,
+      navKeyboard("home")
+    );
+  }
+}
+
+async function renderLastFiveSms(ctx: Context, firebaseId: string, normalized: string) {
+  const id = userId(ctx);
+  const session = getSession(id);
+  if (session.selectedFirebaseId !== firebaseId || session.selectedDeviceId !== normalized) {
+    await answerCallback(ctx, "Select a device first.", { show_alert: true });
+    return;
+  }
+  const connection = await getConnection(id, firebaseId);
+  if (!connection) {
+    await answerCallback(ctx, "Device source not found.", { show_alert: true });
+    return;
+  }
+  try {
+    const root = await readFirebase(connection.firebaseUrl);
+    const device = extractDevices(root).find(item => item.normalizedDeviceId === normalized);
+    if (!device) {
+      await answerCallback(ctx, "Selected device is no longer available.", { show_alert: true });
+      unselectDevice(id);
+      await renderHome(ctx);
+      return;
+    }
+    const events = collectEvents(device, root)
+      .sort((a, b) => {
+        const aTime = a.timestamp ? Date.parse(a.timestamp) : 0;
+        const bTime = b.timestamp ? Date.parse(b.timestamp) : 0;
+        return (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+      })
+      .slice(0, 5);
+    setSession(id, { screen: "last_sms" });
+    startMonitor(id, firebaseId, device);
+    await answerCallback(ctx);
+    await editOrReply(ctx, lastSmsText(device, events), lastSmsKeyboard(firebaseId, normalized));
+  } catch (error) {
+    await answerCallback(ctx, "Unable to read SMS", { show_alert: true });
+    await editOrReply(ctx, `❌ Could not read the selected device.\n\n${shortError(error)}`, navKeyboard("home"));
+  }
+}
+
 bot.start(async ctx => {
   unselectDevice(userId(ctx));
-  if (await guard(ctx)) {
-    await registerStartReferral(ctx);
-    await renderHome(ctx);
-  }
+  if (!(await baseGuard(ctx))) return;
+  await registerStartReferral(ctx);
+  if (admin(ctx) || (await getAccessStatus(userId(ctx))).active) await renderHome(ctx, true);
+  else await renderAccessGate(ctx, true);
 });
-bot.command("cancel", async ctx => { clearSession(userId(ctx)); await ctx.reply("✅ Cancelled.", homeKeyboard(admin(ctx)) as any); });
+bot.command("cancel", async ctx => {
+  clearSession(userId(ctx));
+  const keyboard = premiumizeKeyboard(homeKeyboard(admin(ctx))) as any;
+  await ctx.reply("✅ Cancelled.", Markup.inlineKeyboard(keyboard.inline_keyboard));
+});
 bot.command("myid", async ctx => { await ctx.reply(`🆔 Your Telegram ID is:\n${userId(ctx)}\n\nUse this numeric ID as ADMIN_TELEGRAM_ID for admin access.`); });
 
 bot.on("text", async (ctx, next) => {
@@ -592,6 +778,19 @@ bot.on("text", async (ctx, next) => {
     await renderAdminFreeAccess(ctx);
     return;
   }
+  if (session.awaiting === "access_duration" && admin(ctx)) {
+    const duration = Number(ctx.message.text.trim());
+    if (!Number.isInteger(duration) || duration < 1 || duration > 1440) {
+      await ctx.reply("❌ Access duration must be a whole number from 1 to 1440 minutes.");
+      return;
+    }
+    await setSetting("access_duration_minutes", String(duration));
+    setSession(userId(ctx), { awaiting: undefined });
+    await logSystem("info", "access_duration_changed", `Timed access duration set to ${duration} minutes`, userId(ctx));
+    await ctx.reply(`✅ Timed access duration set to ${duration} minutes.`);
+    await renderAdminFreeAccess(ctx);
+    return;
+  }
   if (
     (session.awaiting === "referral_message" ||
       session.awaiting === "maintenance_message" ||
@@ -630,13 +829,62 @@ bot.on("text", async (ctx, next) => {
   return next();
 });
 
+bot.on("photo", async ctx => {
+  if (!(await guard(ctx))) return;
+  const session = getSession(userId(ctx));
+  if (!admin(ctx) || !["image_welcome", "image_access", "image_device"].includes(session.awaiting ?? "")) return;
+  const awaiting = session.awaiting as "image_welcome" | "image_access" | "image_device";
+  const settingKey = awaiting === "image_welcome"
+    ? IMAGE_SETTING_KEYS.welcome
+    : awaiting === "image_access"
+      ? IMAGE_SETTING_KEYS.access
+      : IMAGE_SETTING_KEYS.device;
+  const photo = ctx.message.photo.at(-1);
+  if (!photo) {
+    await ctx.reply("❌ Telegram photo data was not found. Please send the image again.");
+    return;
+  }
+  await setSetting(settingKey, photo.file_id);
+  setSession(userId(ctx), { awaiting: undefined });
+  await logSystem("info", "bot_image_changed", `${awaiting} image updated`, userId(ctx));
+  await ctx.reply("✅ Image saved. The new visual will appear in that screen's next message.");
+  await renderAdminImages(ctx);
+});
+
 bot.action("noop", async ctx => answerCallback(ctx));
 bot.action("home", async ctx => { unselectDevice(userId(ctx)); if (await guard(ctx)) { await answerCallback(ctx); await renderHome(ctx); } });
 bot.action("free_panels", async ctx => {
-  if (await guard(ctx)) {
+  if (await baseGuard(ctx)) {
     await answerCallback(ctx);
-    await renderFreePanels(ctx);
+    await renderAccessGate(ctx);
   }
+});
+bot.action("verify_access", async ctx => {
+  if (!(await baseGuard(ctx))) return;
+  const id = userId(ctx);
+  const channels = await getRequiredChannels();
+  const membership = await checkRequiredChannels(ctx, channels);
+  if (!membership.allJoined) {
+    await answerCallback(ctx, "Join every required channel first.", { show_alert: true });
+    await renderAccessGate(ctx);
+    return;
+  }
+  await qualifyReferral(id);
+  const stats = await getReferralStats(id);
+  const minimum = Number(await getSetting("minimum_referrals", "3"));
+  if (stats.qualified < minimum) {
+    await answerCallback(ctx, `Need ${minimum - stats.qualified} more qualified referral(s).`, { show_alert: true });
+    await renderAccessGate(ctx);
+    return;
+  }
+  const duration = Math.max(1, Number(await getSetting("access_duration_minutes", "45")) || 45);
+  await grantTimedAccess(id, duration);
+  await logSystem("info", "timed_access_granted", `${duration} minute access granted`, id);
+  await answerCallback(ctx, `Access granted for ${duration} minutes`);
+  await renderHome(ctx);
+});
+bot.action(["new_device", "change_device"], async ctx => {
+  if (await guard(ctx)) await generateAndRenderDevice(ctx);
 });
 bot.action("claim_free_firebase", async ctx => {
   if (!(await guard(ctx))) return;
@@ -745,10 +993,14 @@ bot.action(/^device:([^:]+):(.+)$/, async ctx => {
     return;
   }
   unselectDevice(userId(ctx));
-  setSession(userId(ctx), { selectedFirebaseId: firebaseId, selectedDeviceId: normalized, screen: "device_detail" });
+  setSession(userId(ctx), { selectedFirebaseId: firebaseId, selectedDeviceId: normalized, screen: "device_detail", monitoring: true });
   startMonitor(userId(ctx), firebaseId, device);
   await answerCallback(ctx);
-  await editOrReply(ctx, `━━━━━━━━━━━━━━━━━━━━\n📱 DEVICE DETAILS\n━━━━━━━━━━━━━━━━━━━━\n\n${device.status === "online" ? "🟢" : "🔴"} Status: ${device.status === "online" ? "Online" : "Offline"}\n\n🆔 Device ID:\n${device.deviceId}\n\n📞 Number:\n${device.number ?? "Number unavailable"}\n\n🔋 Battery:\n${device.battery !== undefined ? `${device.battery}%` : "Battery unavailable"}\n\n🕒 Last Seen:\n${device.lastSeen ?? "Last seen unavailable"}\n\n📡 New messages for this selected device will be sent here automatically.\n\n━━━━━━━━━━━━━━━━━━━━`, { inline_keyboard: [[{ text: "📡 Live Messages", callback_data: `events:${firebaseId}:${encodeURIComponent(normalized)}` }, { text: "🔄 Refresh Device", callback_data: `rescan:${firebaseId}` }], [{ text: "🚫 Unselect Number", callback_data: "unselect_device" }], [{ text: "⬅️ Back", callback_data: `devices_firebase:${firebaseId}` }, { text: "🏠 Home", callback_data: "home" }]] });
+  await editOrReply(ctx, deviceDetailText(device, connection.displayName), deviceDetailKeyboard(firebaseId, normalized));
+});
+bot.action(/^last_sms:([^:]+):(.+)$/, async ctx => {
+  if (!(await guard(ctx))) return;
+  await renderLastFiveSms(ctx, ctx.match[1], decodeURIComponent(ctx.match[2]));
 });
 bot.action(/^events:([^:]+):(.+)$/, async ctx => {
   if (!(await guard(ctx))) return;
@@ -831,6 +1083,43 @@ bot.action("admin_connections", async ctx => { if (await guard(ctx) && admin(ctx
 bot.action("admin_settings", async ctx => { if (await guard(ctx) && admin(ctx)) { await answerCallback(ctx); await renderAdminSettings(ctx); } });
 bot.action("admin_free", async ctx => { if (await guard(ctx) && admin(ctx)) { await answerCallback(ctx); await renderAdminFreeAccess(ctx); } });
 bot.action("admin_content", async ctx => { if (await guard(ctx) && admin(ctx)) { await answerCallback(ctx); await renderAdminContent(ctx); } });
+bot.action("admin_images", async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  await answerCallback(ctx);
+  await renderAdminImages(ctx);
+});
+bot.action(/^admin_image_(welcome|access|device)$/, async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  const kind = ctx.match[1] as "welcome" | "access" | "device";
+  const labels = {
+    welcome: "WELCOME / HOME",
+    access: "ACCESS GATE",
+    device: "DEVICE DETAILS"
+  };
+  setSession(userId(ctx), {
+    awaiting: `image_${kind}` as "image_welcome" | "image_access" | "image_device",
+    screen: "admin_images"
+  });
+  await answerCallback(ctx);
+  await editOrReply(
+    ctx,
+    `🖼 SET ${labels[kind]} IMAGE\n\nSend one Telegram photo now.\n\nUse a clean premium banner or portrait artwork. The original user flow stays unchanged; this image is shown above the screen message.\n\nSend /cancel to stop.`,
+    navKeyboard("admin_images")
+  );
+});
+bot.action(/^admin_image_remove_(welcome|access|device)$/, async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  const kind = ctx.match[1] as "welcome" | "access" | "device";
+  const settingKey = kind === "welcome"
+    ? IMAGE_SETTING_KEYS.welcome
+    : kind === "access"
+      ? IMAGE_SETTING_KEYS.access
+      : IMAGE_SETTING_KEYS.device;
+  await setSetting(settingKey, "");
+  await logSystem("info", "bot_image_removed", `${kind} image removed`, userId(ctx));
+  await answerCallback(ctx, "Image removed");
+  await renderAdminImages(ctx);
+});
 bot.action("admin_content_referral", async ctx => {
   if (!(await guard(ctx)) || !admin(ctx)) return;
   setSession(userId(ctx), { awaiting: "referral_message", screen: "admin_content" });
@@ -892,6 +1181,39 @@ bot.action("admin_referrals_custom", async ctx => {
   setSession(userId(ctx), { awaiting: "referral_minimum", screen: "admin_referral_min" });
   await answerCallback(ctx);
   await editOrReply(ctx, "🎯 CUSTOM MINIMUM REFERRALS\n\nSend a whole number from 0 to 1000.\n\nSend /cancel to stop.", navKeyboard("admin_referral_min"));
+});
+bot.action("admin_access_duration", async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  const current = Math.max(1, Number(await getSetting("access_duration_minutes", "45")) || 45);
+  await answerCallback(ctx);
+  await editOrReply(
+    ctx,
+    `⏱ ACCESS DURATION\n\nCurrent duration: ${current} minutes.\n\nChoose a preset or send a custom whole number from 1 to 1440.`,
+    {
+      inline_keyboard: [
+        [15, 30, 45, 60, 120].map(value => ({
+          text: `${value === current ? "✅ " : ""}${value} min`,
+          callback_data: `admin_access_duration_set:${value}`
+        })),
+        [{ text: "✏️ Custom Duration", callback_data: "admin_access_duration_custom" }],
+        [{ text: "⬅️ Free Access", callback_data: "admin_free" }, { text: "🏠 Home", callback_data: "home" }]
+      ]
+    }
+  );
+});
+bot.action(/^admin_access_duration_set:(\d+)$/, async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  const duration = Number(ctx.match[1]);
+  await setSetting("access_duration_minutes", String(duration));
+  await logSystem("info", "access_duration_changed", `Timed access duration set to ${duration} minutes`, userId(ctx));
+  await answerCallback(ctx, `Duration set to ${duration} minutes`);
+  await renderAdminFreeAccess(ctx);
+});
+bot.action("admin_access_duration_custom", async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  setSession(userId(ctx), { awaiting: "access_duration", screen: "admin_free" });
+  await answerCallback(ctx);
+  await editOrReply(ctx, "⏱ CUSTOM ACCESS DURATION\n\nSend a whole number from 1 to 1440 minutes.\n\nSend /cancel to stop.", navKeyboard("admin_access_duration"));
 });
 bot.action("admin_free_pool", async ctx => { if (await guard(ctx) && admin(ctx)) { await answerCallback(ctx); await renderAdminFreePool(ctx); } });
 bot.action("admin_free_pool_add", async ctx => {
@@ -994,6 +1316,10 @@ function startMonitor(telegramId: number, firebaseId: string, device: Device) {
   const poll = async () => {
     if (!isActive()) return;
     try {
+      if (telegramId !== config.ADMIN_TELEGRAM_ID && !(await getAccessStatus(telegramId)).active) {
+        stopMonitor(telegramId, firebaseId, device.normalizedDeviceId);
+        return;
+      }
       const connection = await getConnection(telegramId, firebaseId);
       if (!isActive()) return;
       if (!connection) {

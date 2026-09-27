@@ -1,15 +1,49 @@
 import type { InlineKeyboardMarkup } from "telegraf/types";
 import type {
-  AdminConnection, AdminUser, DeviceSummary, FirebaseConnection,
-  FreeFirebasePanel, ReferralStats, RequiredChannel
+  AccessStatus, AdminConnection, AdminUser, Device, DeviceSummary,
+  FirebaseConnection, FreeFirebasePanel, ReferralStats, RequiredChannel
 } from "./types.js";
+
+type TelegramButton = {
+  text: string;
+  callback_data?: string;
+  url?: string;
+  style?: "bg_primary" | "bg_success" | "bg_danger";
+  [key: string]: unknown;
+};
+
+/**
+ * Bot API 9.6 added native inline-button styles. Telegraf 4.16 does not type
+ * the new field yet, so keep the existing keyboard shapes and add styles at
+ * the final Telegram boundary. Older clients safely ignore the unknown field.
+ */
+export function premiumizeKeyboard(markup: unknown): unknown {
+  if (!markup || typeof markup !== "object") return markup;
+  const keyboard = markup as { inline_keyboard?: TelegramButton[][] };
+  if (!Array.isArray(keyboard.inline_keyboard)) return markup;
+  return {
+    ...keyboard,
+    inline_keyboard: keyboard.inline_keyboard.map(row => row.map(button => {
+      if (button.style) return button;
+      const action = `${button.callback_data ?? ""} ${button.text ?? ""}`.toLowerCase();
+      if (/(remove|delete|disable|ban|stop|danger|maintenance: on|unselect)/.test(action)) {
+        return { ...button, style: "bg_danger" as const };
+      }
+      if (/(claim|generate|new device|change device|verify|join|add|save|send|access)/.test(action)) {
+        return { ...button, style: "bg_success" as const };
+      }
+      if (/(refresh|rescan|view|overview|users|connections|settings|content|referral|audit|logs|firebase|device)/.test(action)) {
+        return { ...button, style: "bg_primary" as const };
+      }
+      return button;
+    }))
+  };
+}
 
 export const homeKeyboard = (showAdmin = false): InlineKeyboardMarkup => ({
   inline_keyboard: [
-    [{ text: "✨ Free Panels", callback_data: "free_panels" }, { text: "📱 Devices", callback_data: "devices" }],
-    [{ text: "➕ Add Firebase", callback_data: "add_firebase" }, { text: "🗂 My Firebase", callback_data: "my_firebase" }],
-    [{ text: "🔄 Refresh", callback_data: "home" }],
-    [{ text: "📘 How to Use", callback_data: "how_to_use" }],
+    [{ text: "🆕 New Device", callback_data: "new_device" }, { text: "📘 How to Use", callback_data: "how_to_use" }],
+    [{ text: "🔄 Refresh", callback_data: "home" }, { text: "🔐 Access / Refer", callback_data: "free_panels" }],
     ...(showAdmin ? [[{ text: "👑 Admin Panel", callback_data: "admin" }]] : [])
   ]
 });
@@ -24,14 +58,14 @@ export function homeText(summary: { connections: number; devices: DeviceSummary 
     "🔥 DEVICE MANAGER",
     "━━━━━━━━━━━━━━━━━━━━",
     "",
-    "Your secure control center for connected Firebase databases and authorized devices.",
+    "Your secure device access center.",
     "",
     "📊 ACCOUNT OVERVIEW",
-    `🔥 Firebase: ${summary.connections}/${firebaseLimit}`,
-    `📱 Devices: ${summary.devices.total}`,
+    `🔥 Device sources: ${summary.connections}/${firebaseLimit}`,
+    `📱 Available devices: ${summary.devices.total}`,
     `🟢 Online: ${summary.devices.online}  ·  🔴 Offline: ${summary.devices.offline}`,
     "",
-    "Choose an action below to continue.",
+    "Choose an action below. A device is selected from the admin pool when you tap New Device.",
     "",
     "━━━━━━━━━━━━━━━━━━━━"
   ].join("\n");
@@ -54,6 +88,128 @@ export function firebaseListText(connections: FirebaseConnection[], summaries: M
   return lines.join("\n");
 }
 
+export function accessGateText(
+  stats: ReferralStats,
+  minimumReferrals: number,
+  durationMinutes: number,
+  channels: RequiredChannel[],
+  joined: Map<string, boolean>,
+  referralLink?: string,
+  access?: AccessStatus
+) {
+  const remaining = Math.max(0, minimumReferrals - stats.qualified);
+  const channelLines = channels.length
+    ? channels.map(channel => `${joined.get(channel.id) ? "✅" : "❌"} ${channel.title}`).join("\n")
+    : "⚠️ Admin has not configured required channels yet.";
+  const accessLine = access?.active
+    ? `✅ Access active for approximately ${access.remainingMinutes} minute(s).`
+    : `🔒 Refer ${remaining} more qualified user${remaining === 1 ? "" : "s"} to unlock ${durationMinutes} minutes of access.`;
+  return [
+    "━━━━━━━━━━━━━━━━━━━━",
+    "🔐 BOT ACCESS REQUIRED",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "",
+    "Start flow:",
+    "1️⃣ Join every required channel",
+    `2️⃣ Refer ${minimumReferrals} user${minimumReferrals === 1 ? "" : "s"}`,
+    `3️⃣ Verify and receive ${durationMinutes} minutes of bot access`,
+    "",
+    `👥 Qualified referrals: ${stats.qualified}/${minimumReferrals}`,
+    `📈 Total referred: ${stats.total}`,
+    accessLine,
+    "",
+    "📣 REQUIRED CHANNELS",
+    channelLines,
+    "",
+    referralLink ? `🔗 Your referral link:\n${referralLink}` : "",
+    "━━━━━━━━━━━━━━━━━━━━"
+  ].filter(Boolean).join("\n").slice(0, 3900);
+}
+
+export function accessGateKeyboard(
+  channels: RequiredChannel[],
+  referralLink?: string
+): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      ...channels
+        .filter(channel => channel.inviteLink || channel.chatId.startsWith("@"))
+        .map(channel => [{
+          text: `📣 Join ${channel.title}`,
+          url: channel.inviteLink ?? `https://t.me/${channel.chatId.slice(1)}`
+        }]),
+      ...(referralLink ? [[{ text: "🔗 REFER & EARN", url: referralLink }]] : []),
+      [{ text: "✅ Verify & Get Access", callback_data: "verify_access" }],
+      [{ text: "📘 How to Use", callback_data: "how_to_use" }]
+    ]
+  };
+}
+
+export function deviceDetailText(device: Device, sourceName: string): string {
+  return [
+    "━━━━━━━━━━━━━━━━━━━━",
+    "📱 DEVICE SELECTED",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "",
+    `🔥 Source: ${sourceName}`,
+    `${device.status === "online" ? "🟢" : "🔴"} Status: ${device.status === "online" ? "Online" : "Offline"}`,
+    "",
+    `🆔 Device ID: ${device.deviceId}`,
+    `📞 Number: ${device.number ?? "Number unavailable"}`,
+    `🔋 Battery: ${device.battery !== undefined ? `${device.battery}%` : "Battery unavailable"}`,
+    `🕒 Last Seen: ${device.lastSeen ?? "Unavailable"}`,
+    "",
+    "Is device ke messages tabhi milenge jab tak yeh device selected hai.",
+    "Back ya Change Device karne par purane device ke messages turant band ho jayenge.",
+    "━━━━━━━━━━━━━━━━━━━━"
+  ].join("\n");
+}
+
+export function deviceDetailKeyboard(firebaseId: string, normalized: string): InlineKeyboardMarkup {
+  const encoded = encodeURIComponent(normalized);
+  return {
+    inline_keyboard: [
+      [{ text: "🔁 Change Device", callback_data: "change_device" }, { text: "📩 Last 5 SMS", callback_data: `last_sms:${firebaseId}:${encoded}` }],
+      [{ text: "⬅️ Back", callback_data: "back" }, { text: "🏠 Home", callback_data: "home" }]
+    ]
+  };
+}
+
+export function lastSmsText(
+  device: Device,
+  events: Array<{ message: string; timestamp?: string }>
+): string {
+  const lines = [
+    "━━━━━━━━━━━━━━━━━━━━",
+    "📩 LAST 5 SMS",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "",
+    `📱 ${device.deviceId}`,
+    `📞 ${device.number ?? "Number unavailable"}`,
+    ""
+  ];
+  if (!events.length) {
+    lines.push("No SMS found for this selected device.");
+  } else {
+    events.slice(0, 5).forEach((event, index) => {
+      lines.push(`${index + 1}. ${event.timestamp ?? "Time unavailable"}`, event.message, "");
+    });
+  }
+  lines.push("Only the currently selected device is shown.", "━━━━━━━━━━━━━━━━━━━━");
+  return lines.join("\n").slice(0, 3900);
+}
+
+export function lastSmsKeyboard(firebaseId: string, normalized: string): InlineKeyboardMarkup {
+  const encoded = encodeURIComponent(normalized);
+  return {
+    inline_keyboard: [
+      [{ text: "🔄 Refresh", callback_data: `last_sms:${firebaseId}:${encoded}` }],
+      [{ text: "🔁 Change Device", callback_data: "change_device" }],
+      [{ text: "⬅️ Back", callback_data: `device:${firebaseId}:${encoded}` }, { text: "🏠 Home", callback_data: "home" }]
+    ]
+  };
+}
+
 export function connectionKeyboard(connections: FirebaseConnection[], prefix: string) {
   return {
     inline_keyboard: [
@@ -69,8 +225,8 @@ export function adminKeyboard(maintenanceEnabled: boolean): InlineKeyboardMarkup
     inline_keyboard: [
       [{ text: "📊 Overview", callback_data: "admin_refresh" }, { text: "👥 Users", callback_data: "admin_users" }],
       [{ text: "🔥 Connections", callback_data: "admin_connections" }, { text: "📢 Broadcast", callback_data: "broadcast" }],
-      [{ text: "🎁 Free Access", callback_data: "admin_free" }],
-      [{ text: "📝 Content", callback_data: "admin_content" }],
+      [{ text: "🔐 Access & Device Pool", callback_data: "admin_free" }],
+      [{ text: "📝 Content", callback_data: "admin_content" }, { text: "🖼 Bot Images", callback_data: "admin_images" }],
       [{ text: "📣 Force Subscribe", callback_data: "admin_channels" }, { text: "🎯 Referral", callback_data: "admin_referral_min" }],
       [{ text: "🔔 Audit Channel", callback_data: "admin_audit_channel" }],
       [{ text: `🛠 Maintenance: ${maintenanceEnabled ? "ON" : "OFF"}`, callback_data: "maintenance" }, { text: "⚙️ Settings", callback_data: "admin_settings" }],
@@ -324,6 +480,47 @@ export function adminContentPrompt(kind: "referral" | "maintenance" | "how_to_us
   return "✏️ EDIT HOW TO USE\n\nSend the complete How to Use message. Multiline text is supported.\n\nSend /cancel to stop.";
 }
 
+export function adminImagesText(
+  welcomeConfigured: boolean,
+  accessConfigured: boolean,
+  deviceConfigured: boolean
+): string {
+  const status = (configured: boolean) => configured ? "✅ Configured" : "⚪ Not configured";
+  return [
+    "━━━━━━━━━━━━━━━━━━━━",
+    "🖼 BOT IMAGE STUDIO",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "",
+    "Give each important screen its own branded visual.",
+    "",
+    `🏠 Welcome / Home: ${status(welcomeConfigured)}`,
+    `🔐 Access Gate: ${status(accessConfigured)}`,
+    `📱 Device Details: ${status(deviceConfigured)}`,
+    "",
+    "Send a Telegram photo after choosing a slot. Telegram file IDs are stored securely, so images remain fast and reliable.",
+    "Recommended: portrait artwork or a clean 16:9 premium banner.",
+    "━━━━━━━━━━━━━━━━━━━━"
+  ].join("\n");
+}
+
+export function adminImagesKeyboard(
+  welcomeConfigured: boolean,
+  accessConfigured: boolean,
+  deviceConfigured: boolean
+): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: "🏠 Set Welcome Image", callback_data: "admin_image_welcome" }],
+      ...(welcomeConfigured ? [[{ text: "🗑 Remove Welcome Image", callback_data: "admin_image_remove_welcome" }]] : []),
+      [{ text: "🔐 Set Access Gate Image", callback_data: "admin_image_access" }],
+      ...(accessConfigured ? [[{ text: "🗑 Remove Access Image", callback_data: "admin_image_remove_access" }]] : []),
+      [{ text: "📱 Set Device Image", callback_data: "admin_image_device" }],
+      ...(deviceConfigured ? [[{ text: "🗑 Remove Device Image", callback_data: "admin_image_remove_device" }]] : []),
+      [{ text: "⬅️ Admin Dashboard", callback_data: "admin" }, { text: "🏠 Home", callback_data: "home" }]
+    ]
+  };
+}
+
 export function adminAuditChannelText(chatId: string, title: string, link: string): string {
   return [
     "━━━━━━━━━━━━━━━━━━━━",
@@ -390,19 +587,25 @@ export function freePanelKeyboard(
   };
 }
 
-export function adminFreeAccessText(minimumReferrals: number, panels: FreeFirebasePanel[], channels: RequiredChannel[]): string {
+export function adminFreeAccessText(
+  minimumReferrals: number,
+  accessDurationMinutes: number,
+  panels: FreeFirebasePanel[],
+  channels: RequiredChannel[]
+): string {
   const available = panels.filter(panel => panel.active && !panel.assignedTo).length;
   const assigned = panels.filter(panel => panel.assignedTo).length;
   return [
     "━━━━━━━━━━━━━━━━━━━━",
-    "🎁 FREE ACCESS CONTROL",
+    "🔐 ACCESS & DEVICE POOL",
     "━━━━━━━━━━━━━━━━━━━━",
     "",
     `🎯 Minimum qualified referrals: ${minimumReferrals}`,
-    `🔥 Free Firebase pool: ${available} available · ${assigned} assigned`,
+    `⏱ Timed bot access: ${accessDurationMinutes} minutes`,
+    `🔥 Device sources: ${available} active · ${assigned} previously assigned`,
     `📣 Force subscribe channels: ${channels.length}`,
     "",
-    "Admin yahan se referral target, reward Firebase pool, aur force subscribe channel gate control kar sakta hai.",
+    "Admin yahan se referral target, access duration, random device source pool, aur required channels control kar sakta hai.",
     "━━━━━━━━━━━━━━━━━━━━"
   ].join("\n");
 }
@@ -411,7 +614,8 @@ export function adminFreeAccessKeyboard(): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
       [{ text: "🎯 Minimum Referrals", callback_data: "admin_referral_min" }],
-      [{ text: "🔥 Manage Free Firebase", callback_data: "admin_free_pool" }],
+      [{ text: "⏱ Access Duration", callback_data: "admin_access_duration" }],
+      [{ text: "🔥 Manage Device Sources", callback_data: "admin_free_pool" }],
       [{ text: "📣 Manage Required Channels", callback_data: "admin_channels" }],
       [{ text: "⬅️ Admin Dashboard", callback_data: "admin" }, { text: "🏠 Home", callback_data: "home" }]
     ]
@@ -426,7 +630,7 @@ export function adminReferralText(minimumReferrals: number): string {
     "",
     `Current minimum: ${minimumReferrals} qualified referrals`,
     "",
-    "Qualified referral ka matlab: referred user ne bot start karke required channels verify kiye hain.",
+    "Qualified referral ka matlab: referred user ne bot start karke required channels verify kiye hain. Target complete hone par timed access milta hai.",
     "━━━━━━━━━━━━━━━━━━━━"
   ].join("\n");
 }
@@ -445,10 +649,10 @@ export function adminReferralKeyboard(minimumReferrals: number): InlineKeyboardM
 export function adminFreePoolText(panels: FreeFirebasePanel[]): string {
   const lines = [
     "━━━━━━━━━━━━━━━━━━━━",
-    "🔥 FREE FIREBASE POOL",
+    "🔥 DEVICE SOURCE POOL",
     "━━━━━━━━━━━━━━━━━━━━",
     "",
-    "Available Firebase reward panels:"
+    "Active Firebase sources used for random device selection:"
   ];
   if (!panels.length) lines.push("", "No free Firebase panels added yet.");
   panels.forEach((panel, index) => {
@@ -468,7 +672,7 @@ export function adminFreePoolKeyboard(panels: FreeFirebasePanel[]): InlineKeyboa
     inline_keyboard: [
       [{ text: "➕ Add Free Firebase", callback_data: "admin_free_pool_add" }],
       ...panels.map(panel => [{
-        text: `🗑 Remove ${panel.displayName}`,
+       text: `🗑 Remove ${panel.displayName}`,
         callback_data: `admin_free_pool_remove:${panel.id}`
       }]),
       [{ text: "⬅️ Free Access", callback_data: "admin_free" }, { text: "🏠 Home", callback_data: "home" }]

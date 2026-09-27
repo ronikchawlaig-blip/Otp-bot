@@ -55,6 +55,12 @@ export interface ReferralStats {
   claimed: boolean;
 }
 
+export interface AccessStatus {
+  active: boolean;
+  expiresAt?: string;
+  remainingMinutes: number;
+}
+
 export interface FreeFirebasePanel {
   id: string;
   firebaseUrl: string;
@@ -85,9 +91,13 @@ export interface Session {
     | "free_firebase_url"
     | "required_channel"
     | "referral_minimum"
+    | "access_duration"
     | "referral_message"
     | "maintenance_message"
     | "how_to_use_message"
-    | "audit_channel";
+    | "audit_channel"
+    | "image_welcome"
+    | "image_access"
+    | "image_device";
   monitoring?: boolean;
 }

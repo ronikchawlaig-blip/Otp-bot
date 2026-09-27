@@ -33,10 +33,12 @@ export async function ensureSchema(): Promise<void> {
       is_banned BOOLEAN NOT NULL DEFAULT FALSE,
       last_active TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       referred_by BIGINT,
-      referral_verified_at TIMESTAMPTZ
+      referral_verified_at TIMESTAMPTZ,
+      access_expires_at TIMESTAMPTZ
     );
     ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_verified_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS access_expires_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS users_referred_by_idx ON users (referred_by);
     CREATE TABLE IF NOT EXISTS firebase_connections (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -109,7 +111,8 @@ export async function ensureSchema(): Promise<void> {
     INSERT INTO admin_settings (key, value) VALUES
       ('maintenance_mode', 'false'),
       ('firebase_limit', '10'),
-      ('minimum_referrals', '3')
+      ('minimum_referrals', '3'),
+      ('access_duration_minutes', '45')
     ON CONFLICT (key) DO NOTHING;
     UPDATE admin_settings SET value = '10' WHERE key = 'firebase_limit' AND value = '2';
   `);
@@ -137,6 +140,35 @@ export async function isBanned(telegramId: number): Promise<boolean> {
     [telegramId]
   );
   return rows[0]?.is_banned ?? false;
+}
+
+export async function getAccessStatus(telegramId: number): Promise<import("./types.js").AccessStatus> {
+  const rows = await query<{ access_expires_at: string | null }>(
+    "SELECT access_expires_at FROM users WHERE telegram_id = $1",
+    [telegramId]
+  );
+  const expiresAt = rows[0]?.access_expires_at ?? undefined;
+  const remainingMinutes = expiresAt
+    ? Math.max(0, Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 60_000))
+    : 0;
+  return {
+    active: remainingMinutes > 0,
+    expiresAt,
+    remainingMinutes,
+  };
+}
+
+export async function grantTimedAccess(telegramId: number, durationMinutes: number): Promise<string> {
+  const rows = await query<{ access_expires_at: string }>(
+    `UPDATE users
+        SET access_expires_at = GREATEST(COALESCE(access_expires_at, NOW()), NOW())
+                              + ($2::text || ' minutes')::interval
+      WHERE telegram_id = $1
+      RETURNING access_expires_at`,
+    [telegramId, Math.max(1, Math.min(durationMinutes, 24 * 60))]
+  );
+  if (!rows[0]) throw new Error("User access could not be updated.");
+  return rows[0].access_expires_at;
 }
 
 export async function getSetting(key: string, fallback: string): Promise<string> {
