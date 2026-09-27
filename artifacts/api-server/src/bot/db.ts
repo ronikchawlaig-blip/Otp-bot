@@ -110,11 +110,11 @@ export async function ensureSchema(): Promise<void> {
     );
     INSERT INTO admin_settings (key, value) VALUES
       ('maintenance_mode', 'false'),
-      ('firebase_limit', '10'),
+      ('firebase_limit', '0'),
       ('minimum_referrals', '3'),
       ('access_duration_minutes', '45')
     ON CONFLICT (key) DO NOTHING;
-    UPDATE admin_settings SET value = '10' WHERE key = 'firebase_limit' AND value = '2';
+    UPDATE admin_settings SET value = '0' WHERE key = 'firebase_limit' AND value <> '0';
   `);
 }
 
