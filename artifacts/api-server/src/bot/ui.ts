@@ -8,12 +8,12 @@ type TelegramButton = {
   text: string;
   callback_data?: string;
   url?: string;
-  style?: "bg_primary" | "bg_success" | "bg_danger";
+  style?: "primary" | "success" | "danger";
   [key: string]: unknown;
 };
 
 /**
- * Bot API 9.6 added native inline-button styles. Telegraf 4.16 does not type
+ * Bot API 9.4 added native inline-button styles. Telegraf 4.16 does not type
  * the new field yet, so keep the existing keyboard shapes and add styles at
  * the final Telegram boundary. Older clients safely ignore the unknown field.
  */
@@ -27,15 +27,15 @@ export function premiumizeKeyboard(markup: unknown): unknown {
       if (button.style) return button;
       const action = `${button.callback_data ?? ""} ${button.text ?? ""}`.toLowerCase();
       if (/(remove|delete|disable|ban|stop|danger|maintenance: on|unselect)/.test(action)) {
-        return { ...button, style: "bg_danger" as const };
+        return { ...button, style: "danger" as const };
       }
       if (/(claim|generate|new device|change device|verify|join|add|save|send|access)/.test(action)) {
-        return { ...button, style: "bg_success" as const };
+        return { ...button, style: "success" as const };
       }
       if (/(refresh|rescan|view|overview|users|connections|settings|content|referral|audit|logs|firebase|device)/.test(action)) {
-        return { ...button, style: "bg_primary" as const };
+        return { ...button, style: "primary" as const };
       }
-      return button;
+      return { ...button, style: "primary" as const };
     }))
   };
 }
