@@ -52,7 +52,11 @@ export const navKeyboard = (backData = "back"): InlineKeyboardMarkup => ({
   inline_keyboard: [[{ text: "⬅️ Back", callback_data: backData }, { text: "🏠 Home", callback_data: "home" }]]
 });
 
-export function homeText(summary: { connections: number; devices: DeviceSummary }, firebaseLimit = 10) {
+function firebaseLimitLabel(firebaseLimit: number): string {
+  return firebaseLimit > 0 ? String(firebaseLimit) : "∞";
+}
+
+export function homeText(summary: { connections: number; devices: DeviceSummary }, firebaseLimit = 0) {
   return [
     "━━━━━━━━━━━━━━━━━━━━",
     "🔥 OTP HUB  •  DEVICE CENTER",
@@ -61,7 +65,7 @@ export function homeText(summary: { connections: number; devices: DeviceSummary 
     "Your private, secure device access center.",
     "",
     "📊 ACCOUNT OVERVIEW",
-    `🔥 Active sources     ${summary.connections}/${firebaseLimit}`,
+    `🔥 Active sources     ${summary.connections}/${firebaseLimitLabel(firebaseLimit)}`,
     `📱 Available devices  ${summary.devices.total}`,
     `🟢 Online             ${summary.devices.online}`,
     `🔴 Offline            ${summary.devices.offline}`,
@@ -73,8 +77,8 @@ export function homeText(summary: { connections: number; devices: DeviceSummary 
   ].join("\n");
 }
 
-export function firebaseListText(connections: FirebaseConnection[], summaries: Map<string, DeviceSummary>, firebaseLimit = 10) {
-  const lines = ["━━━━━━━━━━━━━━━━━━━━", "🔥 MY FIREBASE", "━━━━━━━━━━━━━━━━━━━━", "", `Connections: ${connections.length}/${firebaseLimit}`, ""];
+export function firebaseListText(connections: FirebaseConnection[], summaries: Map<string, DeviceSummary>, firebaseLimit = 0) {
+  const lines = ["━━━━━━━━━━━━━━━━━━━━", "🔥 MY FIREBASE", "━━━━━━━━━━━━━━━━━━━━", "", `Connections: ${connections.length}/${firebaseLimitLabel(firebaseLimit)}`, ""];
   if (!connections.length) lines.push("No Firebase connections yet.", "", "Tap “Add Firebase” to connect your first database.");
   connections.forEach((connection, i) => {
     const s = summaries.get(connection.id) ?? { total: 0, online: 0, offline: 0 };
@@ -338,25 +342,23 @@ export function adminConnectionsKeyboard(): InlineKeyboardMarkup {
   };
 }
 
-export function adminSettingsText(firebaseLimit: number, maintenanceEnabled: boolean): string {
+export function adminSettingsText(_firebaseLimit: number, maintenanceEnabled: boolean): string {
   return [
     "━━━━━━━━━━━━━━━━━━━━",
     "⚙️ ADMIN SETTINGS",
     "━━━━━━━━━━━━━━━━━━━━",
     "",
     `🛠 Maintenance mode: ${maintenanceEnabled ? "ON" : "OFF"}`,
-    `🔥 Firebase connection limit: ${firebaseLimit}`,
+    "🔥 Firebase connections: Unlimited",
     "",
-    "Choose a connection limit below. This applies to all users.",
+    "Bulk Firebase additions are checked source-by-source before activation.",
     "━━━━━━━━━━━━━━━━━━━━"
   ].join("\n");
 }
 
-export function adminSettingsKeyboard(firebaseLimit: number, maintenanceEnabled: boolean): InlineKeyboardMarkup {
-  const options = [2, 5, 10, 20];
+export function adminSettingsKeyboard(_firebaseLimit: number, maintenanceEnabled: boolean): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
-      options.map(limit => ({ text: `${limit === firebaseLimit ? "✅ " : ""}${limit}`, callback_data: `admin_limit:${limit}` })),
       [{ text: `🛠 Maintenance ${maintenanceEnabled ? "OFF" : "ON"}`, callback_data: "maintenance" }],
       [{ text: "⬅️ Admin Dashboard", callback_data: "admin" }, { text: "🏠 Home", callback_data: "home" }]
     ]
@@ -364,7 +366,7 @@ export function adminSettingsKeyboard(firebaseLimit: number, maintenanceEnabled:
 }
 
 export const DEFAULT_HOW_TO_USE_MESSAGE =
-  "ℹ️ HOW TO USE\n\nAdd up to 10 Firebase Realtime Database URLs in one message. Use one URL per line or separate them with commas. Each URL is checked one-by-one and dead URLs are reported separately. Device data is deduplicated before display. Use Rescan for the latest data.\n\nℹ️ Firebase links and short summaries may be shared with admins for support.";
+  "ℹ️ HOW TO USE\n\nAdd one or many Firebase Realtime Database URLs in one message. Use one URL per line or separate them with commas. Each URL is checked one-by-one and dead URLs are reported separately. Device data is deduplicated before display. Use Refresh for the latest data.\n\nℹ️ Firebase links and short summaries may be shared with admins for support.";
 
 export const DEFAULT_MAINTENANCE_MESSAGE =
   "🛠 BOT UNDER MAINTENANCE\n\nThe bot is currently undergoing maintenance.\nPlease try again later.";
@@ -654,7 +656,7 @@ export function adminFreePoolText(panels: FreeFirebasePanel[]): string {
     "🔥 DEVICE SOURCE POOL",
     "━━━━━━━━━━━━━━━━━━━━",
     "",
-    "Active Firebase sources used for random device selection:"
+    "Active Firebase sources used for random device selection. Paste one or many URLs; every source is checked before it becomes active:"
   ];
   if (!panels.length) lines.push("", "No free Firebase panels added yet.");
   panels.forEach((panel, index) => {
@@ -672,7 +674,7 @@ export function adminFreePoolText(panels: FreeFirebasePanel[]): string {
 export function adminFreePoolKeyboard(panels: FreeFirebasePanel[]): InlineKeyboardMarkup {
   return {
     inline_keyboard: [
-      [{ text: "➕ Add Free Firebase", callback_data: "admin_free_pool_add" }],
+      [{ text: "➕ Add Firebase Sources", callback_data: "admin_free_pool_add" }],
       ...panels.map(panel => [{
        text: `🗑 Remove ${panel.displayName}`,
         callback_data: `admin_free_pool_remove:${panel.id}`
