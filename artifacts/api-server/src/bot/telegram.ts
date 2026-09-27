@@ -823,7 +823,16 @@ bot.on("text", async (ctx, next) => {
     setSession(userId(ctx), { awaiting: undefined });
     const users = await (await import("./db.js")).query<{ telegram_id: string }>("SELECT telegram_id FROM users WHERE is_banned = false", []);
     setSession(userId(ctx), { screen: "broadcast_preview" });
-    await ctx.reply(`━━━━━━━━━━━━━━━━━━━━\n📢 BROADCAST PREVIEW\n━━━━━━━━━━━━━━━━━━━━\n\nRecipients: ${users.length} Users\n\n${ctx.message.text}`, Markup.inlineKeyboard([[Markup.button.callback("✅ Send", `broadcast_send:${Buffer.from(ctx.message.text).toString("base64url")}`), Markup.button.callback("❌ Cancel", "admin")]]));
+    const previewKeyboard = premiumizeKeyboard({
+      inline_keyboard: [[
+        { text: "✅ Send", callback_data: `broadcast_send:${Buffer.from(ctx.message.text).toString("base64url")}` },
+        { text: "❌ Cancel", callback_data: "admin" }
+      ]]
+    }) as any;
+    await ctx.reply(
+      `━━━━━━━━━━━━━━━━━━━━\n📢 BROADCAST PREVIEW\n━━━━━━━━━━━━━━━━━━━━\n\nRecipients: ${users.length} Users\n\n${ctx.message.text}`,
+      Markup.inlineKeyboard(previewKeyboard.inline_keyboard)
+    );
     return;
   }
   return next();
