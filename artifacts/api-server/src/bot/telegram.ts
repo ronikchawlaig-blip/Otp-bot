@@ -40,6 +40,7 @@ type DeviceMonitor = {
   sourceName?: string;
 };
 const monitors = new Map<string, DeviceMonitor>();
+const homeMonitors = new Map<number, DeviceMonitor>();
 const answeredCallbacks = new WeakSet<object>();
 const POOL_SCAN_TIMEOUT_MS = 8_000;
 const POOL_CACHE_TTL_MS = 10_000;
@@ -350,6 +351,55 @@ function refreshHomeInBackground(ctx: Context) {
       await logSystem("warn", "background_home_refresh_failed", shortError(error), id);
     }
   })();
+}
+
+function stopHomeMonitor(telegramId: number) {
+  const monitor = homeMonitors.get(telegramId);
+  if (!monitor) return;
+  monitor.active = false;
+  clearInterval(monitor.timer);
+  homeMonitors.delete(telegramId);
+}
+
+function startHomeMonitor(ctx: Context) {
+  const telegramId = userId(ctx);
+  const chatId = ctx.chat?.id;
+  const messageId = callbackMessageId(ctx);
+  if (!chatId || !messageId) return;
+  stopHomeMonitor(telegramId);
+  let monitor: DeviceMonitor | undefined;
+  const poll = async () => {
+    if (!monitor?.active || homeMonitors.get(telegramId) !== monitor) return;
+    if (getSession(telegramId).screen !== "home") {
+      stopHomeMonitor(telegramId);
+      return;
+    }
+    try {
+      const [{ connections, summaries }, poolSnapshot] = await Promise.all([
+        refreshAllConnections(telegramId),
+        readPoolSources(true)
+      ]);
+      if (!monitor?.active || getSession(telegramId).screen !== "home") return;
+      const combined = aggregateHomeSources(connections, summaries, poolSnapshot);
+      const keyboard = premiumizeKeyboard(homeKeyboard(telegramId === config.ADMIN_TELEGRAM_ID)) as any;
+      await bot.telegram.editMessageText(
+        chatId,
+        messageId,
+        undefined,
+        homeText({ connections: combined.sourceCount, devices: combined.devices }, Number(await getSetting("firebase_limit", "0"))),
+        { reply_markup: keyboard }
+      );
+    } catch (error) {
+      await logSystem("warn", "home_auto_refresh_failed", shortError(error), telegramId);
+    }
+  };
+  monitor = {
+    active: true,
+    timer: setInterval(() => { void poll(); }, config.FIREBASE_SCAN_INTERVAL_MS),
+    chatId,
+    messageId
+  };
+  homeMonitors.set(telegramId, monitor);
 }
 
 function startPoolRefreshLoop() {
@@ -1120,6 +1170,7 @@ bot.action("home", async ctx => {
   if (!(await guard(ctx))) return;
   await answerCallback(ctx);
   await renderHome(ctx, false, false);
+  startHomeMonitor(ctx);
   refreshHomeInBackground(ctx);
 });
 bot.action("free_panels", async ctx => {
@@ -1304,6 +1355,7 @@ bot.action("back", async ctx => {
   else if (screen === "devices") await renderDevices(ctx);
   else {
     await renderHome(ctx, false, false);
+    startHomeMonitor(ctx);
     refreshHomeInBackground(ctx);
   }
 });
@@ -1704,6 +1756,7 @@ function unselectDevice(telegramId: number) {
     clearInterval(monitor.timer);
     monitors.delete(key);
   }
+  stopHomeMonitor(telegramId);
   setSession(telegramId, {
     selectedFirebaseId: undefined,
     selectedDeviceId: undefined,
