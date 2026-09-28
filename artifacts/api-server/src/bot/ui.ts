@@ -18,9 +18,23 @@ type TelegramButton = {
  * the final Telegram boundary. Older clients safely ignore the unknown field.
  */
 export function premiumizeKeyboard(markup: unknown): unknown {
-  // Keep callback payloads compatible with every Telegram client/API version.
-  // The premium treatment is provided by the text layout and button labels.
-  return markup;
+  if (!markup || typeof markup !== "object") return markup;
+  const keyboard = markup as { inline_keyboard?: TelegramButton[][] };
+  if (!Array.isArray(keyboard.inline_keyboard)) return markup;
+  return {
+    ...keyboard,
+    inline_keyboard: keyboard.inline_keyboard.map(row => row.map(button => {
+      if (button.style) return button;
+      const action = `${button.callback_data ?? ""} ${button.text ?? ""}`.toLowerCase();
+      if (/(remove|delete|disable|ban|stop|danger|maintenance: on|unselect)/.test(action)) {
+        return { ...button, style: "danger" as const };
+      }
+      if (/(claim|generate|new device|change device|verify|join|add|save|send|access|gift)/.test(action)) {
+        return { ...button, style: "success" as const };
+      }
+      return { ...button, style: "primary" as const };
+    }))
+  };
 }
 
 export const homeKeyboard = (showAdmin = false): InlineKeyboardMarkup => ({
