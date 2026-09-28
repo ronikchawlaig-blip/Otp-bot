@@ -171,6 +171,32 @@ export async function grantTimedAccess(telegramId: number, durationMinutes: numb
   return rows[0].access_expires_at;
 }
 
+export async function grantTimedAccessToUsers(telegramIds: number[], durationMinutes: number): Promise<number> {
+  const ids = [...new Set(telegramIds.filter(id => Number.isSafeInteger(id) && id > 0))];
+  if (!ids.length) return 0;
+  const rows = await query<{ telegram_id: string }>(
+    `UPDATE users
+        SET access_expires_at = GREATEST(COALESCE(access_expires_at, NOW()), NOW())
+                              + ($2::text || ' minutes')::interval
+      WHERE telegram_id = ANY($1::bigint[])
+      RETURNING telegram_id`,
+    [ids, Math.max(1, Math.min(durationMinutes, 24 * 60))]
+  );
+  return rows.length;
+}
+
+export async function grantTimedAccessToAllUsers(durationMinutes: number): Promise<number> {
+  const rows = await query<{ telegram_id: string }>(
+    `UPDATE users
+        SET access_expires_at = GREATEST(COALESCE(access_expires_at, NOW()), NOW())
+                              + ($1::text || ' minutes')::interval
+      WHERE is_banned = false
+      RETURNING telegram_id`,
+    [Math.max(1, Math.min(durationMinutes, 24 * 60))]
+  );
+  return rows.length;
+}
+
 export async function getSetting(key: string, fallback: string): Promise<string> {
   const rows = await query<{ value: string }>("SELECT value FROM admin_settings WHERE key = $1", [key]);
   return rows[0]?.value ?? fallback;
