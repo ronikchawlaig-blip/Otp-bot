@@ -146,12 +146,22 @@ async function guard(ctx: Context): Promise<boolean> {
 
 async function editOrReply(ctx: Context, text: string, keyboard?: unknown) {
   if ("callbackQuery" in ctx && ctx.callbackQuery) {
+    const styledKeyboard = premiumizeKeyboard(keyboard) as any;
     try {
-      await ctx.editMessageText(text, keyboard ? { reply_markup: keyboard as any } : undefined);
+      await ctx.editMessageText(text, styledKeyboard ? { reply_markup: styledKeyboard } : undefined);
       return;
     } catch (error) {
-      // Do not create a second message after a button tap. A failed edit is
-      // usually a harmless no-op or an expired Telegram message.
+      // Some Telegram API/client versions reject the optional style field.
+      // Retry the same message with the standard keyboard; never send a
+      // duplicate reply after a button tap.
+      if (keyboard && styledKeyboard !== keyboard) {
+        try {
+          await ctx.editMessageText(text, { reply_markup: keyboard as any });
+          return;
+        } catch (fallbackError) {
+          error = fallbackError;
+        }
+      }
       if (!/message is not modified|message can't be edited|message to edit not found/i.test(shortError(error))) {
         await logSystem("warn", "callback_message_edit_failed", shortError(error), userId(ctx));
       }
@@ -187,7 +197,15 @@ async function editOrReplyWithConfiguredImage(
   try {
     const callbackMessage = "callbackQuery" in ctx ? ctx.callbackQuery?.message : undefined;
     if (callbackMessage && "photo" in callbackMessage) {
-      await ctx.editMessageCaption(caption, styledKeyboard ? { reply_markup: styledKeyboard } as any : undefined);
+      try {
+        await ctx.editMessageCaption(caption, styledKeyboard ? { reply_markup: styledKeyboard } as any : undefined);
+      } catch (error) {
+        if (styledKeyboard !== keyboard) {
+          await ctx.editMessageCaption(caption, keyboard ? { reply_markup: keyboard as any } : undefined);
+        } else {
+          throw error;
+        }
+      }
       return;
     }
     if (callbackMessage && ctx.chat) {
