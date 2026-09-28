@@ -95,9 +95,12 @@ export interface Session {
     | "referral_message"
     | "maintenance_message"
     | "how_to_use_message"
+    | "welcome_message"
     | "audit_channel"
     | "image_welcome"
     | "image_access"
-    | "image_device";
+    | "image_device"
+    | "gift_access_user";
   monitoring?: boolean;
+  giftAccessTargetId?: number;
 }
