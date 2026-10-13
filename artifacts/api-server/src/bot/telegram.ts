@@ -358,8 +358,11 @@ async function renderHome(ctx: Context, includeImage = false, refresh = true) {
   ]);
   clearSession(id);
   const combined = aggregateHomeSources(connections, summaries, pool);
-  const limit = Number(await getSetting("firebase_limit", "0"));
-  const welcomeMessage = await getSetting("welcome_message", DEFAULT_WELCOME_MESSAGE);
+  const [limitValue, welcomeMessage] = await Promise.all([
+    getSetting("firebase_limit", "0"),
+    getSetting("welcome_message", DEFAULT_WELCOME_MESSAGE)
+  ]);
+  const limit = Number(limitValue);
   await editOrReplyWithConfiguredImage(
     ctx,
     homeText({ connections: combined.sourceCount, devices: combined.devices }, limit, welcomeMessage),
@@ -1417,9 +1420,13 @@ bot.command("admin", async ctx => {
 });
 async function renderAdmin(ctx: Context) {
   if (!admin(ctx)) return;
-  const stats = await adminStats();
-  const maintenanceEnabled = (await getSetting("maintenance_mode", "false")) === "true";
-  const pool = cachedPoolSources() ?? await readPoolSources(false).catch(() => undefined);
+  const cachedPool = cachedPoolSources();
+  const [stats, maintenanceValue, pool] = await Promise.all([
+    adminStats(),
+    getSetting("maintenance_mode", "false"),
+    cachedPool ?? readPoolSources(false).catch(() => undefined)
+  ]);
+  const maintenanceEnabled = maintenanceValue === "true";
   const poolSummary = (pool?.sources ?? []).filter(source => source.ok || source.stale).reduce((total, source) => {
     addSummary(total, summaryForDevices(source.devices));
     return total;
@@ -1441,8 +1448,12 @@ async function renderAdminConnections(ctx: Context) {
 
 async function renderAdminSettings(ctx: Context) {
   if (!admin(ctx)) return;
-  const limit = Number(await getSetting("firebase_limit", "10"));
-  const maintenanceEnabled = (await getSetting("maintenance_mode", "false")) === "true";
+  const [limitValue, maintenanceValue] = await Promise.all([
+    getSetting("firebase_limit", "10"),
+    getSetting("maintenance_mode", "false")
+  ]);
+  const limit = Number(limitValue);
+  const maintenanceEnabled = maintenanceValue === "true";
   await editOrReply(ctx, adminSettingsText(limit, maintenanceEnabled), adminSettingsKeyboard(limit, maintenanceEnabled));
 }
 bot.action("admin", async ctx => { if (await guard(ctx) && admin(ctx)) { await answerCallback(ctx); await renderAdmin(ctx); } });
