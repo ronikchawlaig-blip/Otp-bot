@@ -2,8 +2,8 @@ import { Telegraf, Markup } from "telegraf";
 import type { Context } from "telegraf";
 import { config } from "./config.js";
 import {
-  addConnection, adminStats, countConnections, ensureUser, eventSeen, getConnection, getConnections,
-  getAdminConnections, getAdminUsers, getDevices, getSetting, getSummary, isBanned, logSystem,
+  addConnection, adminStats, countConnections, eventSeen, getConnection, getConnections,
+  getAdminConnections, getAdminUsers, getDevices, getSetting, getSummary, logSystem,
   markConnectionChecked, markEventSeen, pool, removeConnection, replaceDevices, setSetting,
   setUserBanned, ensureSchema, registerReferral, qualifyReferral, getReferralStats,
   addFreeFirebasePanel, getFreeFirebasePanels, removeFreeFirebasePanel, claimFreeFirebase,
@@ -99,16 +99,45 @@ async function answerCallback(ctx: Context, text?: string, extra?: any) {
   }
 }
 
-async function baseGuard(ctx: Context): Promise<boolean> {
+async function baseGuard(ctx: Context, requireAccess = false): Promise<boolean> {
   void answerCallback(ctx);
-  await ensureUser(ctx);
-  const id = userId(ctx);
-  if (await isBanned(id)) {
+  const from = ctx.from;
+  if (!from) throw new Error("Missing Telegram user");
+
+  // Keep button authorization to one database round trip instead of serially
+  // upserting the user and checking ban, maintenance, and access state.
+  const { rows } = await pool.query<{
+    isBanned: boolean;
+    hasAccess: boolean;
+    maintenanceMode: string;
+    maintenanceMessage: string | null;
+  }>(
+    `WITH user_state AS (
+       INSERT INTO users (telegram_id, username, first_name)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (telegram_id) DO UPDATE
+       SET username = EXCLUDED.username, first_name = EXCLUDED.first_name, last_active = NOW()
+       RETURNING is_banned, access_expires_at
+     )
+     SELECT user_state.is_banned AS "isBanned",
+            COALESCE(user_state.access_expires_at > NOW(), FALSE) AS "hasAccess",
+            COALESCE((SELECT value FROM admin_settings WHERE key = 'maintenance_mode'), 'false') AS "maintenanceMode",
+            (SELECT value FROM admin_settings WHERE key = 'maintenance_message') AS "maintenanceMessage"
+       FROM user_state`,
+    [from.id, from.username ?? null, from.first_name ?? ""]
+  );
+  const status = rows[0];
+  if (!status) return false;
+  if (status.isBanned) {
     await ctx.reply("🚫 Your access is currently restricted.");
     return false;
   }
-  if ((await getSetting("maintenance_mode", "false")) === "true" && !admin(ctx)) {
-    await ctx.reply(await getSetting("maintenance_message", DEFAULT_MAINTENANCE_MESSAGE));
+  if (status.maintenanceMode === "true" && userId(ctx) !== config.ADMIN_TELEGRAM_ID) {
+    await ctx.reply(status.maintenanceMessage ?? DEFAULT_MAINTENANCE_MESSAGE);
+    return false;
+  }
+  if (requireAccess && userId(ctx) !== config.ADMIN_TELEGRAM_ID && !status.hasAccess) {
+    await renderAccessGate(ctx);
     return false;
   }
   return true;
@@ -136,12 +165,7 @@ async function renderAccessGate(ctx: Context, includeImage = false) {
 }
 
 async function guard(ctx: Context): Promise<boolean> {
-  if (!(await baseGuard(ctx))) return false;
-  if (admin(ctx)) return true;
-  const access = await getAccessStatus(userId(ctx));
-  if (access.active) return true;
-  await renderAccessGate(ctx);
-  return false;
+  return baseGuard(ctx, true);
 }
 
 async function editOrReply(ctx: Context, text: string, keyboard?: unknown) {
