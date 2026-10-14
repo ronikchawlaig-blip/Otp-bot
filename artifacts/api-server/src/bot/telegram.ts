@@ -44,7 +44,9 @@ const monitors = new Map<string, DeviceMonitor>();
 const homeMonitors = new Map<number, DeviceMonitor>();
 const answeredCallbacks = new WeakSet<object>();
 const POOL_SCAN_TIMEOUT_MS = 8_000;
-const POOL_CACHE_TTL_MS = 10_000;
+const POOL_SCAN_CONCURRENCY = 2;
+const POOL_CACHE_TTL_MS = 60_000;
+const POOL_REFRESH_INTERVAL_MS = Math.max(config.FIREBASE_SCAN_INTERVAL_MS, POOL_CACHE_TTL_MS);
 let botUsername = "";
 const IMAGE_SETTING_KEYS = {
   welcome: "welcome_image_file_id",
@@ -335,23 +337,32 @@ async function readPoolSources(force = false): Promise<PoolSnapshot> {
 
   poolSnapshotPromise = (async () => {
     const panels = (await getFreeFirebasePanels()).filter(panel => panel.active);
-    const results = await Promise.all(panels.map(async panel => {
-      try {
-        const root = await readFirebase(panel.firebaseUrl, POOL_SCAN_TIMEOUT_MS);
-        const result = { panel, devices: extractDevices(root), ok: true } satisfies PoolSourceSnapshot;
-        poolLastGoodSources.set(panel.firebaseUrl, result);
-        return result;
-      } catch (error) {
-        const previous = poolLastGoodSources.get(panel.firebaseUrl);
-        return {
-          panel,
-          devices: previous?.devices ?? [],
-          ok: false,
-          stale: Boolean(previous),
-          error: shortError(error)
-        } satisfies PoolSourceSnapshot;
-      }
-    }));
+    const results: PoolSourceSnapshot[] = [];
+    for (let offset = 0; offset < panels.length; offset += POOL_SCAN_CONCURRENCY) {
+      const batch = await Promise.all(
+        panels.slice(offset, offset + POOL_SCAN_CONCURRENCY).map(async panel => {
+          try {
+            const root = await readFirebase(panel.firebaseUrl, POOL_SCAN_TIMEOUT_MS);
+            // Pool summaries and selection need device fields, not the full raw payload.
+            // Keep parsed Firebase trees out of the long-lived cache.
+            const devices = extractDevices(root).map(device => ({ ...device, payload: {} }));
+            const result = { panel, devices, ok: true } satisfies PoolSourceSnapshot;
+            poolLastGoodSources.set(panel.firebaseUrl, result);
+            return result;
+          } catch (error) {
+            const previous = poolLastGoodSources.get(panel.firebaseUrl);
+            return {
+              panel,
+              devices: previous?.devices ?? [],
+              ok: false,
+              stale: Boolean(previous),
+              error: shortError(error)
+            } satisfies PoolSourceSnapshot;
+          }
+        })
+      );
+      results.push(...batch);
+    }
     const value = { sources: results, configuredSources: panels.length };
     poolSnapshotCache = { value, expiresAt: Date.now() + POOL_CACHE_TTL_MS };
     return value;
@@ -378,7 +389,7 @@ async function renderHome(ctx: Context, includeImage = false, refresh = true) {
   unselectDevice(id);
   const [{ connections, summaries }, pool] = await Promise.all([
     refresh ? refreshAllConnections(id) : allSummary(id),
-    refresh ? readPoolSources(true).catch(() => cachedPoolSources()) : cachedPoolSources()
+    refresh ? readPoolSources(false).catch(() => cachedPoolSources()) : cachedPoolSources()
   ]);
   clearSession(id);
   const combined = aggregateHomeSources(connections, summaries, pool);
@@ -431,7 +442,7 @@ function startHomeMonitor(ctx: Context) {
     try {
       const [{ connections, summaries }, poolSnapshot] = await Promise.all([
         refreshAllConnections(telegramId),
-        readPoolSources(true)
+        readPoolSources(false)
       ]);
       if (!monitor?.active || getSession(telegramId).screen !== "home") return;
       const combined = aggregateHomeSources(connections, summaries, poolSnapshot);
@@ -466,7 +477,7 @@ function startPoolRefreshLoop() {
       await logSystem("warn", "pool_auto_refresh_failed", shortError(error));
     }
   };
-  poolRefreshTimer = setInterval(() => { void refresh(); }, config.FIREBASE_SCAN_INTERVAL_MS);
+  poolRefreshTimer = setInterval(() => { void refresh(); }, POOL_REFRESH_INTERVAL_MS);
   void refresh();
 }
 
