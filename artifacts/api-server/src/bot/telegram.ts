@@ -971,7 +971,7 @@ async function selectRandomPoolDevice(telegramId: number): Promise<SelectedPoolD
     .filter(source => !source.ok || !source.devices.length)
     .map(source => `${source.panel.displayName}: ${source.error ?? "no devices found"}`);
   const available = pool.sources.flatMap(source =>
-    source.ok ? source.devices.map(device => ({ panel: source.panel, device, devices: source.devices })) : []
+    source.ok ? source.devices.map(device => ({ panel: source.panel, device })) : []
   );
   if (!available.length) {
     throw new Error(`No Firebase source could provide a device.\n\n${failures.slice(0, 3).join("\n")}`);
@@ -983,7 +983,8 @@ async function selectRandomPoolDevice(telegramId: number): Promise<SelectedPoolD
   const existingConnections = await getConnections(telegramId);
   const existing = existingConnections.find(connection => connection.firebaseUrl === selected.panel.firebaseUrl);
   const firebaseId = existing?.id ?? await addConnection(telegramId, selected.panel.firebaseUrl, selected.panel.displayName);
-  await replaceDevices(firebaseId, selected.devices);
+  // startMonitor performs a fresh scan immediately after the screen renders;
+  // avoid deleting and reinserting every cached device before that scan.
   await markConnectionChecked(firebaseId, "connected");
   return {
     firebaseId,
@@ -1032,11 +1033,8 @@ async function generateAndRenderDevice(ctx: Context) {
 
 async function renderLastFiveSms(ctx: Context, firebaseId: string, normalized: string) {
   const id = userId(ctx);
-  const session = getSession(id);
-  if (session.selectedFirebaseId !== firebaseId || session.selectedDeviceId !== normalized) {
-    await answerCallback(ctx, "Select a device first.", { show_alert: true });
-    return;
-  }
+  // The callback already identifies the selected device. Validate ownership
+  // and existence against the user's connection instead of a volatile session map.
   const connection = await getConnection(id, firebaseId);
   if (!connection) {
     await answerCallback(ctx, "Device source not found.", { show_alert: true });
@@ -1052,6 +1050,12 @@ async function renderLastFiveSms(ctx: Context, firebaseId: string, normalized: s
       await renderHome(ctx);
       return;
     }
+    setSession(id, {
+      screen: "last_sms",
+      selectedFirebaseId: firebaseId,
+      selectedDeviceId: normalized,
+      monitoring: true
+    });
     const events = collectEvents(device, root)
       .sort((a, b) => {
         const aTime = a.timestamp ? Date.parse(a.timestamp) : 0;
@@ -1059,7 +1063,6 @@ async function renderLastFiveSms(ctx: Context, firebaseId: string, normalized: s
         return (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
       })
       .slice(0, 5);
-    setSession(id, { screen: "last_sms" });
     startMonitor(id, firebaseId, device);
     await editOrReply(ctx, lastSmsText(device, events), lastSmsKeyboard(firebaseId, normalized));
   } catch (error) {
