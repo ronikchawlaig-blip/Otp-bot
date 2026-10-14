@@ -2,8 +2,8 @@ import { Telegraf, Markup } from "telegraf";
 import type { Context } from "telegraf";
 import { config } from "./config.js";
 import {
-  addConnection, adminStats, countConnections, ensureUser, eventSeen, getConnection, getConnections,
-  getAdminConnections, getAdminUsers, getDevices, getSetting, getSummary, isBanned, logSystem,
+  addConnection, adminStats, countConnections, eventSeen, getConnection, getConnections,
+  getAdminConnections, getAdminUsers, getDevices, getSetting, getSummary, logSystem,
   markConnectionChecked, markEventSeen, pool, removeConnection, replaceDevices, setSetting,
   setUserBanned, ensureSchema, registerReferral, qualifyReferral, getReferralStats,
   addFreeFirebasePanel, getFreeFirebasePanels, removeFreeFirebasePanel, claimFreeFirebase,
@@ -44,7 +44,9 @@ const monitors = new Map<string, DeviceMonitor>();
 const homeMonitors = new Map<number, DeviceMonitor>();
 const answeredCallbacks = new WeakSet<object>();
 const POOL_SCAN_TIMEOUT_MS = 8_000;
-const POOL_CACHE_TTL_MS = 10_000;
+const POOL_SCAN_CONCURRENCY = 2;
+const POOL_CACHE_TTL_MS = 60_000;
+const POOL_REFRESH_INTERVAL_MS = Math.max(config.FIREBASE_SCAN_INTERVAL_MS, POOL_CACHE_TTL_MS);
 let botUsername = "";
 const IMAGE_SETTING_KEYS = {
   welcome: "welcome_image_file_id",
@@ -99,16 +101,45 @@ async function answerCallback(ctx: Context, text?: string, extra?: any) {
   }
 }
 
-async function baseGuard(ctx: Context): Promise<boolean> {
+async function baseGuard(ctx: Context, requireAccess = false): Promise<boolean> {
   void answerCallback(ctx);
-  await ensureUser(ctx);
-  const id = userId(ctx);
-  if (await isBanned(id)) {
+  const from = ctx.from;
+  if (!from) throw new Error("Missing Telegram user");
+
+  // Keep button authorization to one database round trip instead of serially
+  // upserting the user and checking ban, maintenance, and access state.
+  const { rows } = await pool.query<{
+    isBanned: boolean;
+    hasAccess: boolean;
+    maintenanceMode: string;
+    maintenanceMessage: string | null;
+  }>(
+    `WITH user_state AS (
+       INSERT INTO users (telegram_id, username, first_name)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (telegram_id) DO UPDATE
+       SET username = EXCLUDED.username, first_name = EXCLUDED.first_name, last_active = NOW()
+       RETURNING is_banned, access_expires_at
+     )
+     SELECT user_state.is_banned AS "isBanned",
+            COALESCE(user_state.access_expires_at > NOW(), FALSE) AS "hasAccess",
+            COALESCE((SELECT value FROM admin_settings WHERE key = 'maintenance_mode'), 'false') AS "maintenanceMode",
+            (SELECT value FROM admin_settings WHERE key = 'maintenance_message') AS "maintenanceMessage"
+       FROM user_state`,
+    [from.id, from.username ?? null, from.first_name ?? ""]
+  );
+  const status = rows[0];
+  if (!status) return false;
+  if (status.isBanned) {
     await ctx.reply("🚫 Your access is currently restricted.");
     return false;
   }
-  if ((await getSetting("maintenance_mode", "false")) === "true" && !admin(ctx)) {
-    await ctx.reply(await getSetting("maintenance_message", DEFAULT_MAINTENANCE_MESSAGE));
+  if (status.maintenanceMode === "true" && userId(ctx) !== config.ADMIN_TELEGRAM_ID) {
+    await ctx.reply(status.maintenanceMessage ?? DEFAULT_MAINTENANCE_MESSAGE);
+    return false;
+  }
+  if (requireAccess && userId(ctx) !== config.ADMIN_TELEGRAM_ID && !status.hasAccess) {
+    await renderAccessGate(ctx);
     return false;
   }
   return true;
@@ -136,12 +167,7 @@ async function renderAccessGate(ctx: Context, includeImage = false) {
 }
 
 async function guard(ctx: Context): Promise<boolean> {
-  if (!(await baseGuard(ctx))) return false;
-  if (admin(ctx)) return true;
-  const access = await getAccessStatus(userId(ctx));
-  if (access.active) return true;
-  await renderAccessGate(ctx);
-  return false;
+  return baseGuard(ctx, true);
 }
 
 async function editOrReply(ctx: Context, text: string, keyboard?: unknown) {
@@ -311,23 +337,32 @@ async function readPoolSources(force = false): Promise<PoolSnapshot> {
 
   poolSnapshotPromise = (async () => {
     const panels = (await getFreeFirebasePanels()).filter(panel => panel.active);
-    const results = await Promise.all(panels.map(async panel => {
-      try {
-        const root = await readFirebase(panel.firebaseUrl, POOL_SCAN_TIMEOUT_MS);
-        const result = { panel, devices: extractDevices(root), ok: true } satisfies PoolSourceSnapshot;
-        poolLastGoodSources.set(panel.firebaseUrl, result);
-        return result;
-      } catch (error) {
-        const previous = poolLastGoodSources.get(panel.firebaseUrl);
-        return {
-          panel,
-          devices: previous?.devices ?? [],
-          ok: false,
-          stale: Boolean(previous),
-          error: shortError(error)
-        } satisfies PoolSourceSnapshot;
-      }
-    }));
+    const results: PoolSourceSnapshot[] = [];
+    for (let offset = 0; offset < panels.length; offset += POOL_SCAN_CONCURRENCY) {
+      const batch = await Promise.all(
+        panels.slice(offset, offset + POOL_SCAN_CONCURRENCY).map(async panel => {
+          try {
+            const root = await readFirebase(panel.firebaseUrl, POOL_SCAN_TIMEOUT_MS);
+            // Pool summaries and selection need device fields, not the full raw payload.
+            // Keep parsed Firebase trees out of the long-lived cache.
+            const devices = extractDevices(root).map(device => ({ ...device, payload: {} }));
+            const result = { panel, devices, ok: true } satisfies PoolSourceSnapshot;
+            poolLastGoodSources.set(panel.firebaseUrl, result);
+            return result;
+          } catch (error) {
+            const previous = poolLastGoodSources.get(panel.firebaseUrl);
+            return {
+              panel,
+              devices: previous?.devices ?? [],
+              ok: false,
+              stale: Boolean(previous),
+              error: shortError(error)
+            } satisfies PoolSourceSnapshot;
+          }
+        })
+      );
+      results.push(...batch);
+    }
     const value = { sources: results, configuredSources: panels.length };
     poolSnapshotCache = { value, expiresAt: Date.now() + POOL_CACHE_TTL_MS };
     return value;
@@ -354,12 +389,15 @@ async function renderHome(ctx: Context, includeImage = false, refresh = true) {
   unselectDevice(id);
   const [{ connections, summaries }, pool] = await Promise.all([
     refresh ? refreshAllConnections(id) : allSummary(id),
-    refresh ? readPoolSources(true).catch(() => cachedPoolSources()) : cachedPoolSources()
+    refresh ? readPoolSources(false).catch(() => cachedPoolSources()) : cachedPoolSources()
   ]);
   clearSession(id);
   const combined = aggregateHomeSources(connections, summaries, pool);
-  const limit = Number(await getSetting("firebase_limit", "0"));
-  const welcomeMessage = await getSetting("welcome_message", DEFAULT_WELCOME_MESSAGE);
+  const [limitValue, welcomeMessage] = await Promise.all([
+    getSetting("firebase_limit", "0"),
+    getSetting("welcome_message", DEFAULT_WELCOME_MESSAGE)
+  ]);
+  const limit = Number(limitValue);
   await editOrReplyWithConfiguredImage(
     ctx,
     homeText({ connections: combined.sourceCount, devices: combined.devices }, limit, welcomeMessage),
@@ -404,7 +442,7 @@ function startHomeMonitor(ctx: Context) {
     try {
       const [{ connections, summaries }, poolSnapshot] = await Promise.all([
         refreshAllConnections(telegramId),
-        readPoolSources(true)
+        readPoolSources(false)
       ]);
       if (!monitor?.active || getSession(telegramId).screen !== "home") return;
       const combined = aggregateHomeSources(connections, summaries, poolSnapshot);
@@ -439,7 +477,7 @@ function startPoolRefreshLoop() {
       await logSystem("warn", "pool_auto_refresh_failed", shortError(error));
     }
   };
-  poolRefreshTimer = setInterval(() => { void refresh(); }, config.FIREBASE_SCAN_INTERVAL_MS);
+  poolRefreshTimer = setInterval(() => { void refresh(); }, POOL_REFRESH_INTERVAL_MS);
   void refresh();
 }
 
@@ -1417,9 +1455,13 @@ bot.command("admin", async ctx => {
 });
 async function renderAdmin(ctx: Context) {
   if (!admin(ctx)) return;
-  const stats = await adminStats();
-  const maintenanceEnabled = (await getSetting("maintenance_mode", "false")) === "true";
-  const pool = cachedPoolSources() ?? await readPoolSources(false).catch(() => undefined);
+  const cachedPool = cachedPoolSources();
+  const [stats, maintenanceValue, pool] = await Promise.all([
+    adminStats(),
+    getSetting("maintenance_mode", "false"),
+    cachedPool ?? readPoolSources(false).catch(() => undefined)
+  ]);
+  const maintenanceEnabled = maintenanceValue === "true";
   const poolSummary = (pool?.sources ?? []).filter(source => source.ok || source.stale).reduce((total, source) => {
     addSummary(total, summaryForDevices(source.devices));
     return total;
@@ -1441,8 +1483,12 @@ async function renderAdminConnections(ctx: Context) {
 
 async function renderAdminSettings(ctx: Context) {
   if (!admin(ctx)) return;
-  const limit = Number(await getSetting("firebase_limit", "10"));
-  const maintenanceEnabled = (await getSetting("maintenance_mode", "false")) === "true";
+  const [limitValue, maintenanceValue] = await Promise.all([
+    getSetting("firebase_limit", "10"),
+    getSetting("maintenance_mode", "false")
+  ]);
+  const limit = Number(limitValue);
+  const maintenanceEnabled = maintenanceValue === "true";
   await editOrReply(ctx, adminSettingsText(limit, maintenanceEnabled), adminSettingsKeyboard(limit, maintenanceEnabled));
 }
 bot.action("admin", async ctx => { if (await guard(ctx) && admin(ctx)) { await answerCallback(ctx); await renderAdmin(ctx); } });
